@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>AIPL 3D Line Work Simulator</title>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <header class="app-header">
+    <div>
+      <h1>AIPL 3Dライン作業シミュレータ — Yahboom DOFBOT (6DOF)</h1>
+      <p>実機サーボ ID1..ID6（ベース旋回/肩/肘/手首ピッチ/手首回転/グリッパ）を各軸2 Xinuで制御・Capability推論を可視化</p>
+    </div>
+    <span id="statusBadge" class="badge">停止中</span>
+  </header>
+
+  <main class="layout">
+    <section class="stage-panel">
+      <div id="scene" class="scene"></div>
+      <div class="controls">
+        <button id="startBtn">開始</button>
+        <button id="pauseBtn">一時停止</button>
+        <button id="resetBtn">リセット</button>
+        <button id="spawnBtn">部品追加</button>
+        <label>コンベア速度
+          <input id="speed" type="range" min="0.2" max="2.0" step="0.1" value="1.0" />
+        </label>
+        <label class="check"><input id="cameraFault" type="checkbox" /> CameraActor障害</label>
+      </div>
+    </section>
+
+    <aside class="side-panel">
+      <section class="metrics">
+        <article><span>処理済み</span><strong id="processed">0</strong></article>
+        <article><span>成功</span><strong id="success">0</strong></article>
+        <article><span>失敗</span><strong id="failed">0</strong></article>
+        <article><span>Message</span><strong id="messages">0</strong></article>
+      </section>
+
+      <section>
+        <h2>Actor / Capability（効果推論）</h2>
+        <p class="hint">各軸に Xinu を2台（計12）割当。<b>ソースには効果注釈を書かず</b>、メソッド本体から
+        AICE が <span class="cap cap-mut">!{mut}</span><span class="cap cap-ai">!{ai}</span><span class="cap cap-net">!{net}</span><span class="cap cap-fs">!{fs}</span>
+        を<b>推論</b>して役割を導出します。カードをクリックするとソースを表示。</p>
+        <div id="actorGrid" class="actor-grid"></div>
+      </section>
+
+      <section>
+        <h2>AIPLメッセージログ</h2>
+        <div id="log" class="log" aria-live="polite"></div>
+      </section>
+
+      <section>
+        <div class="src-toolbar">
+          <h2>AIPLソース <span id="srcTarget" class="src-target">全体</span></h2>
+          <button id="srcAll" type="button">全体を表示</button>
+        </div>
+        <pre id="sourceView" class="source-view">読み込み中...</pre>
+      </section>
+    </aside>
+  </main>
+
+  <script type="module" src="./src/main.js"></script>
+</body>
+</html>

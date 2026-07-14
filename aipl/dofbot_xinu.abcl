@@ -1,0 +1,128 @@
+// dofbot_xinu.abcl —— Yahboom DOFBOT (6DOF / Raspberry Pi 5) 実機制御
+// ===========================================================================
+//   実機 DOFBOT は 15kg シリアルバスサーボ 6 個。Yahboom Arm_Lib と同じ API で駆動する:
+//     Arm_serial_servo_write(id, angle, ms)  … サーボ id を angle[deg] へ ms[ms] で駆動
+//     Arm_serial_servo_read(id)              … サーボ id の現在角を読む
+//
+//   サーボ割当（6 軸）:
+//     ID1 ベース旋回(yaw) / ID2 肩 / ID3 肘 / ID4 手首ピッチ / ID5 手首回転 / ID6 グリッパ
+//   各サーボ(=各軸)に soft-Xinu を 2 台 = 計 12 Xinu。
+//
+//   Capability は「ソースに書かない」。各メソッド本体の一次作用(primitive)を
+//   AICE の効果推論が走査し、!{mut, net, ai, fs} を自動導出して役割を推論する:
+//     Arm_serial_servo_write / grip_set / フィールド代入 → mut（アクチュエーション）
+//     send / now / reply / remote                        → net（メッシュ通信）
+//     ai_infer / vision_detect / llm_ask                 → ai （AI 推論）
+//     file_write / persist                               → fs （永続化）
+// ===========================================================================
+
+// ── 各軸 Xinu-A：サーボ・モータ（実機サーボを駆動。mut を持つ唯一の役割）──
+class ServoMotor {
+  var id  = 0;
+  var pos = 90.0;
+  method write(angle, ms) {
+    pos = angle;                            // フィールド代入 → mut
+    Arm_serial_servo_write(id, angle, ms);  // 実機バスサーボ駆動 → mut
+    reply(1);                               // reply → net
+  }
+  method get() { reply(pos); }              // 読み出しのみ → net
+}
+
+// ── 各軸 Xinu-B：サーボ・センサ（バスサーボの現在角を計測・報告。read-only）──
+class ServoSensor {
+  var id = 0;
+  method read() {
+    var a = Arm_serial_servo_read(id);      // 実機サーボ角の読取(sense) → 作用なし
+    reply(a);                               // reply → net
+  }
+}
+
+// ── カメラ・アクター（手首 HD カメラ + 3D 深度。AI 物体検出）──
+class CameraActor {
+  method capture() {
+    var img = camera_grab();                // フレーム取得
+    var obj = vision_detect(img);           // 物体検出 → ai
+    send RecognitionActor.classify(obj);    // send → net
+  }
+}
+
+// ── 認識アクター（色/形の AI 分類。DOFBOT の色認識・把持対象判定）──
+class RecognitionActor {
+  method classify(obj) {
+    var label = ai_infer(obj);              // 分類推論 → ai
+    var bin = "A";
+    if (label == "blue") { bin = "B"; }
+    send PlannerActor.plan(obj, bin);       // send → net
+  }
+}
+
+// ── 搬送アクター（アーム 5 関節 ID1..ID5 を目標姿勢へ動かす。駆動は各モータへ委譲＝net）──
+class ArmMover {
+  method to(q, ms) {
+    var id = 1;
+    while (id < 6) do {                      // ID1..ID5
+      var m = motor_of(id);
+      now m.write(q[id], ms);               // now でサーボ・モータへ依頼 → net（mut は持たない）
+      id = id + 1;
+    }
+    reply(1);                               // reply → net
+  }
+}
+
+// ── 計画アクター（逆運動学 + Pick&Place シーケンス）──
+//    「掴む→回転→離す」を実機の順序どおりに発行する。サーボは直接動かせない＝mut を持たない。
+class PlannerActor {
+  method plan(obj, bin) {
+    var above = inverse_kinematics(obj, 0); // 物体の真上（ホバー）
+    var grasp = inverse_kinematics(obj, 1); // 物体位置（下降先）
+    var over  = bin_pose(bin, 1);           // bin 上（ホバー）
+    var down  = bin_pose(bin, 0);           // bin へ下降
+    var mover = arm_mover();                // 搬送アクター
+    var claw  = motor_of(6);                // ID6 グリッパ
+
+    now claw.write(90, 400);                // ① グリッパを開く
+    now mover.to(above, 800);               // ② 物体の上へ接近
+    now mover.to(grasp, 700);               // ③ 物体まで下降
+    now claw.write(20, 600);                // ④ 把持（グリッパを閉じる）
+    now mover.to(above, 600);               // ⑤ 持ち上げ
+    now mover.to(over, 900);                // ⑥ ベース旋回で搬送（回転）
+    now mover.to(down, 600);                // ⑦ bin 上で下降
+    now claw.write(90, 600);                // ⑧ 解放（グリッパを開く）
+    now mover.to(above, 500);               // ⑨ 退避
+    send SafetyActor.complete(obj);         // 完了通知 → net
+  }
+}
+
+// ── 安全アクター（作業空間・非常停止の監視。イベントを永続ログへ）──
+class SafetyActor {
+  method complete(obj) {
+    file_write("cycle.log", "ok");          // 永続化 → fs
+    reply(1);                               // reply → net
+  }
+  method abort(reason) {
+    file_write("cycle.log", reason);        // fs
+    send Coordinator.halt();                // net
+  }
+}
+
+// ── 調整アクター（6 サーボ × 2 = 12 Xinu を生成し、知覚→計画→駆動を巡回）──
+class Coordinator {
+  var motors  = [];
+  var sensors = [];
+  method setup() {
+    var id = 1;
+    while (id < 7) do {                      // ID1..ID6
+      var m = new ServoMotor();
+      var s = new ServoSensor();
+      array_push(motors, m);
+      array_push(sensors, s);
+      id = id + 1;
+    }
+    reply(1);                               // net
+  }
+  method tick() {
+    send CameraActor.capture();             // 1 サイクル起動 → net
+    reply(1);
+  }
+  method halt() { reply(0); }               // net
+}

@@ -1,0 +1,58 @@
+// AIPL 3D Line Work Simulator
+// This program describes the actor organization used by the browser host.
+
+class CameraActor {
+  init() { print("camera ready"); }
+  detect(part) {
+    send recognition.classify(part);
+  }
+}
+
+class RecognitionActor {
+  init() { print("recognition ready"); }
+  classify(part) {
+    if (part.color == "red") {
+      send planner.plan(part, "A");
+    } else {
+      send planner.plan(part, "B");
+    }
+  }
+}
+
+class PlannerActor {
+  init() { print("planner ready"); }
+  plan(part, box) {
+    var trajectory = ik.solve(part.position, box);
+    send arm.execute(part, trajectory, box);
+  }
+}
+
+class ArmActor {
+  init() { print("6DOF arm ready"); }
+  execute(part, trajectory, box) {
+    send gripper.close(part);
+    send self.move(trajectory);
+    send gripper.open(part, box);
+  }
+}
+
+class GripperActor {
+  init() { print("gripper ready"); }
+  close(part) { print("close"); }
+  open(part, box) { send safety.complete(part, box); }
+}
+
+class SafetyActor {
+  init() { print("safety ready"); }
+  complete(part, box) { print("cycle completed"); }
+  abort(part, reason) { print(reason); }
+}
+
+global {
+  var camera = new CameraActor();
+  var recognition = new RecognitionActor();
+  var planner = new PlannerActor();
+  var arm = new ArmActor();
+  var gripper = new GripperActor();
+  var safety = new SafetyActor();
+}
