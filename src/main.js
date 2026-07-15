@@ -1,14 +1,47 @@
 import { ActorRuntime, BaseActor } from './aipl_runtime.js';
-import { LineSimulator, KINDS } from './simulator.js';
+import { LineSimulator, KINDS, WRIST } from './simulator.js';
+import * as TM from './tinyml.js';
 import * as L from './layout.js';
 
 const ui = Object.fromEntries(
   ['processed','success','failed','graspErr','messages','statusBadge','log','actorGrid','sourceView',
-   'srcTarget','speed','cameraFault','shelfPanel','pcActor','pcLine','follow']
+   'srcTarget','speed','cameraFault','shelfPanel','pcActor','pcLine','follow',
+   'wristCanvas','recogLabel','recogConf','recogBars','recogNote','visionAcc']
     .map(id => [id, document.getElementById(id)]));
 const simulator = new LineSimulator(document.getElementById('scene'));
-let stats = { processed:0, success:0, failed:0, graspErr:0 };
+let stats = { processed:0, success:0, failed:0, graspErr:0, seen:0, correct:0 };
 let activeApp = '';
+
+// ===================== TinyML（手首カメラ画像の分類） =====================
+// 学習済みの重みは rl/train_tinyml.py が実レンダ画像から作る。
+let MODEL = null;
+TM.loadModel().then(m => {
+  MODEL = m;
+  log('AICE', `TinyML 読込: ${TM.NFEAT}→${m.hidden}→3 (${m.nparam} params, 学習時 test acc ${(m.test_acc*100).toFixed(1)}%)`);
+}).catch(e => {
+  ui.recogNote.textContent = `モデル未読込: ${e.message}`;
+  log('AICE', `TinyML モデルなし → 認識できません (${e.message})`);
+});
+
+// 手首カメラの PiP。TinyML に渡すのと同一のピクセルをそのまま拡大表示する。
+function drawWrist(frame) {
+  const c = ui.wristCanvas; if (!c) return;
+  const n = frame.res;
+  if (c.width !== n) { c.width = n; c.height = n; }
+  c.getContext('2d').putImageData(new ImageData(frame.rgba, n, n), 0, 0);
+}
+function showRecognition(r, truth) {
+  ui.recogLabel.textContent = TM.LABELS[r.label];
+  ui.recogLabel.style.color = `#${KINDS[r.label].hex.toString(16).padStart(6, '0')}`;
+  ui.recogConf.textContent = `信頼度 ${(r.conf * 100).toFixed(1)}%`;
+  ui.recogBars.innerHTML = TM.CLASSES.map((c, i) =>
+    `<div class="pbar"><span>${TM.LABELS[c]}</span>`
+    + `<i style="width:${(r.probs[i] * 100).toFixed(1)}%;background:#${KINDS[c].hex.toString(16).padStart(6,'0')}"></i>`
+    + `<b>${(r.probs[i] * 100).toFixed(0)}%</b></div>`).join('');
+  const ok = r.label === truth;
+  ui.recogNote.textContent = ok ? '正解' : `誤認識（正解は ${TM.LABELS[truth]}）`;
+  ui.recogNote.className = 'recog-note ' + (ok ? 'ok' : 'bad');
+}
 
 // ===================== Capability（効果）推論エンジン =====================
 // AIPL ソースに !{...} は書かない。各メソッド本体の一次作用(primitive)を走査して
@@ -107,7 +140,9 @@ const PCMAP = {
   'recog.classify':   ['RecognitionActor','ai_infer(det)'],
   'shelf.assign':     ['ShelfActor',      'shelf_alloc(shelf)'],
   'shelf.ship':       ['ShelfActor',      'shelf_clear(shelf)'],
-  'plan.ik':          ['PlannerActor',    'inverse_kinematics(obj, 40)'],
+  'plan.approach':    ['PlannerActor',    'inverse_kinematics(obj, 40)'],
+  'plan.ik':          ['PlannerActor',    'grip_angle(obj)'],
+  'inspect':          ['CameraActor',     'camera_grab()'],
   'open':             ['PlannerActor',    '// ①'],
   'above':            ['PlannerActor',    '// ②'],
   'descend':          ['PlannerActor',    '// ③'],
@@ -249,6 +284,7 @@ function refresh() {
   ui.processed.textContent = stats.processed; ui.success.textContent = stats.success;
   ui.failed.textContent = stats.failed; ui.messages.textContent = runtime.messageCount;
   ui.graspErr.textContent = stats.graspErr.toFixed(1);
+  ui.visionAcc.textContent = stats.seen ? (100 * stats.correct / stats.seen).toFixed(0) : '—';
   const aj = simulator.activeServo;
   document.querySelectorAll('.actor').forEach(el => {
     const id = el.dataset.actor;
@@ -261,8 +297,8 @@ function refresh() {
 class ConveyorActor extends BaseActor {
   arrived(part) {
     setPC('conveyor.arrived', 'ConveyorActor');
-    this.log(`ストッパで停止 → 知覚サイクル起動 (${KINDS[part.userData.color].label})`);
-    this.send('CameraActor', 'capture', part);
+    this.log('ストッパで停止 → まず撮像姿勢へ（見てから決める）');
+    this.send('PlannerActor', 'approach', part);
   }
   release(part) {
     setPC('conveyor.release', 'ConveyorActor');
@@ -272,23 +308,34 @@ class ConveyorActor extends BaseActor {
   feed() { this.log('belt_drive(1) → 次の部品を停止位置へ'); }
 }
 class CameraActor extends BaseActor {
+  // 手首カメラを実際に描画してピクセルを読む。これが camera_grab の実体。
   capture(part) {
     setPC('camera.capture', 'CameraActor');
     if (ui.cameraFault.checked) {
-      this.log('vision_detect 失敗 (障害注入)');
+      this.log('camera_grab 失敗 (障害注入)');
       this.send('SafetyActor', 'abort', part, 'camera unavailable'); return;
     }
-    this.log(`camera_grab → vision_detect → 物体 1 個`);
-    this.send('RecognitionActor', 'classify', part);
+    const frame = simulator.grabWristFrame();
+    drawWrist(frame);
+    const feat = TM.features(frame);
+    this.log(`camera_grab → ${frame.res}x${frame.res} を撮像 → 特徴 ${feat.length} 次元`);
+    this.send('RecognitionActor', 'classify', part, feat);
   }
 }
 class RecognitionActor extends BaseActor {
-  classify(part) {
+  // TinyML の出力だけで棚を決める。part の色は「答え合わせ」にしか使わない
+  // ので、誤認識すれば本当に違う色の棚へ運ばれる。
+  classify(part, feat) {
     setPC('recog.classify', 'RecognitionActor');
-    const color = part.userData.color;
-    const shelf = { red:'A', blue:'B', green:'C' }[color];
-    this.log(`ai_infer → color="${color}" → 棚${shelf}`);
-    this.send('ShelfActor', 'assign', part, color, shelf);
+    if (!MODEL) { this.log('TinyML モデル未読込 → 中断'); busy = false; return; }
+    const r = TM.infer(MODEL, feat);
+    const truth = part.userData.color;
+    showRecognition(r, truth);
+    stats.seen++; if (r.label === truth) stats.correct++;
+    const shelf = { red:'A', blue:'B', green:'C' }[r.label];
+    this.log(`tinyml_infer → "${r.label}" 信頼度 ${(r.conf*100).toFixed(1)}% → 棚${shelf}`
+      + (r.label === truth ? '' : `  ※誤認識(正解 ${truth})`));
+    this.send('ShelfActor', 'assign', part, r.label, shelf);
   }
 }
 class ShelfActor extends BaseActor {
@@ -298,7 +345,7 @@ class ShelfActor extends BaseActor {
     const got = simulator.allocSlot(color);
     if (!got) { this.log(`棚${shelf} に空きなし`); busy = false; return; }
     this.log(`shelf_alloc(${shelf}) → 段${got.slot.tier + 1}・枠${got.slot.slot + 1}`);
-    this.send('PlannerActor', 'plan', part, shelf, got);
+    this.send('PlannerActor', 'place', part, shelf, got);
   }
   ship(color, shelf) {
     setPC('shelf.ship', 'ShelfActor');
@@ -308,10 +355,17 @@ class ShelfActor extends BaseActor {
   }
 }
 class PlannerActor extends BaseActor {
-  plan(part, shelf, got) {
+  // ①② 撮像姿勢へ。到着してから CameraActor に撮らせる。
+  approach(part) {
+    setPC('plan.approach', 'PlannerActor');
+    this.log('inverse_kinematics → 部品の真上(撮像姿勢)を解く');
+    simulator.beginApproach(part, () => this.send('CameraActor', 'capture', part));
+  }
+  // ③〜⑪ 認識結果で決まった棚へ運ぶ
+  place(part, shelf, got) {
     setPC('plan.ik', 'PlannerActor');
-    this.log(`inverse_kinematics → 接近/把持/搬送/設置の姿勢を生成 (棚${shelf})`);
-    simulator.beginCycle(part, got.rack, got.slot, res => {
+    this.log(`inverse_kinematics → 把持/搬送/設置の姿勢を生成 (棚${shelf})`);
+    simulator.beginPickPlace(part, got.rack, got.slot, res => {
       stats.graspErr = res.graspErr * L.UNIT_MM;
       this.send('SafetyActor', 'complete', res, shelf);
     });
@@ -382,7 +436,7 @@ document.getElementById('pauseBtn').addEventListener('click', () => setRunning(f
 document.getElementById('spawnBtn').addEventListener('click', () => simulator.spawnPart());
 document.getElementById('resetBtn').addEventListener('click', () => {
   setRunning(false); simulator.reset(); runtime.queue = []; runtime.messageCount = 0; busy = false;
-  stats = { processed:0, success:0, failed:0, graspErr:0 };
+  stats = { processed:0, success:0, failed:0, graspErr:0, seen:0, correct:0 };
   ui.log.innerHTML = ''; refreshShelves(); refresh(); log('AICE','simulation reset');
 });
 document.getElementById('srcAll').addEventListener('click', showAll);
@@ -405,4 +459,4 @@ refresh();
 if (new URLSearchParams(location.search).has('auto')) setRunning(true);   // ?auto で自動開始
 
 // ヘッドレス検証用フック
-window.__sim = { simulator, stats: () => stats, runtime, L };
+window.__sim = { simulator, stats: () => stats, runtime, L, TM, model: () => MODEL };

@@ -10,14 +10,29 @@
   <header class="app-header">
     <div>
       <h1>AIPL 3Dライン作業シミュレータ — Yahboom DOFBOT (6DOF)</h1>
-      <p>コンベアの部品を<b>逆運動学で正確に把持</b>し、<b>色の一致する棚</b>へ置く動作を繰り返します。実行中の AIPL ソース行をリアルタイムに表示。</p>
+      <p>手首カメラの画像を <b>TinyML</b> で認識し、<b>逆運動学で正確に把持</b>して<b>色の一致する棚</b>へ置く動作を繰り返します。実行中の AIPL ソース行をリアルタイムに表示。</p>
     </div>
     <span id="statusBadge" class="badge">停止中</span>
   </header>
 
   <main class="layout">
     <section class="stage-panel">
-      <div id="scene" class="scene"></div>
+      <div class="scene-wrap">
+        <div id="scene" class="scene"></div>
+        <!-- 手首カメラ。TinyML に入力するのと同一のピクセルを拡大表示している -->
+        <div class="wrist-hud">
+          <div class="wrist-head">手首カメラ <span>ID5先端 · 96×96</span></div>
+          <canvas id="wristCanvas" class="wrist-cam" width="96" height="96"></canvas>
+          <div class="recog">
+            <div class="recog-top">
+              <strong id="recogLabel">—</strong>
+              <span id="recogConf"></span>
+            </div>
+            <div id="recogBars" class="recog-bars"></div>
+            <div id="recogNote" class="recog-note">撮像待ち</div>
+          </div>
+        </div>
+      </div>
       <div class="controls">
         <button id="startBtn">開始</button>
         <button id="pauseBtn">一時停止</button>
@@ -36,6 +51,7 @@
         <article><span>成功</span><strong id="success">0</strong></article>
         <article><span>失敗</span><strong id="failed">0</strong></article>
         <article><span>把持誤差</span><strong id="graspErr">0.0</strong><em>mm</em></article>
+        <article><span>認識率</span><strong id="visionAcc">—</strong><em>%</em></article>
         <article><span>Message</span><strong id="messages">0</strong></article>
       </section>
 

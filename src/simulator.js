@@ -2,6 +2,7 @@ import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.164.1/+esm';
 import { OrbitControls } from 'https://cdn.jsdelivr.net/npm/three@0.164.1/examples/jsm/controls/OrbitControls.js/+esm';
 import { GEO, solveIK, servoAngles, servoOutOfRange } from './ik.js';
 import * as L from './layout.js';
+import { T } from './layout.js';        // 各フェーズの所要時間（強化学習が最適化する）
 
 // ── Yahboom DOFBOT (6DOF / Raspberry Pi 5) 忠実CG ──────────────────────────
 //   ID1 ベース旋回 / ID2 肩 / ID3 肘 / ID4 手首ピッチ / ID5 手首回転 / ID6 グリッパ
@@ -19,6 +20,17 @@ export const KINDS = {
   blue:  { hex: 0x3b82f6, half: 0.150, label: '青・円柱' },
   green: { hex: 0x22c55e, half: 0.156, label: '緑・六角柱' },
 };
+// 手首カメラ。RES は「TinyML 分類器が実際に受け取る解像度」そのもの。
+// 画面右上の PiP には、この同じピクセルを拡大して出す（見せる絵と推論する絵を一致させる）。
+//
+// noise: 実機の安価な USB カメラ相当の劣化モデル。これが無いと画像が理想的すぎて、
+// 分類器は「平均色」だけで解けてしまい TinyML が何の仕事もしない（実際 test acc が
+// epoch 0 で 100% になった）。露出ゆらぎ・ホワイトバランス偏り・センサノイズを載せる。
+export const WRIST = {
+  fov: 55, res: 96,
+  noise: { gain: [0.55, 1.45], wb: [0.85, 1.15], sigma: 12 },
+};
+
 const FINGER_T = 0.07;                  // 指の厚み
 const GRIP_X = { closed: 0.09, open: 0.30 };
 // 開度 t(0..1) → 指の中心 x。掴み代 half の部品は指の内面が触れる t で閉じる。
@@ -44,6 +56,9 @@ export class LineSimulator {
     this.activeServo = -1;
     this.stationPart = null;          // ストッパで停止中の部品
     this.racks = [];                  // { key,color,group,slots:[{pos,part}] }
+    // カメラ劣化モデル用の擬似乱数（seed 固定 = 学習データと実行が再現可能）
+    let _s = 20260715;
+    this.rand = () => { _s = (_s * 1103515245 + 12345) & 0x7fffffff; return _s / 0x7fffffff; };
     this.HOME = solveIK(...homeTarget()).q;
     this.initThree();
   }
@@ -78,6 +93,11 @@ export class LineSimulator {
 
     this.buildConveyor(); this.buildRacks(); this.buildArm();
     this.applyJoints(this.HOME); this.setGrip(1);
+
+    // 手首カメラの描画先。ここから読んだピクセルが TinyML の入力になる。
+    this.wristRT = new THREE.WebGLRenderTarget(WRIST.res, WRIST.res);
+    this.wristPixels = new Uint8Array(WRIST.res * WRIST.res * 4);
+
     this.resize(); window.addEventListener('resize', () => this.resize());
   }
 
@@ -246,19 +266,43 @@ export class LineSimulator {
     j5.add(this.makeServo(0.3));
 
     const hand = new THREE.Group(); hand.position.y = 0.22; j5.add(hand);
-    const cam = new THREE.Mesh(new THREE.BoxGeometry(0.3, 0.2, 0.14),
-      new THREE.MeshStandardMaterial({ color: COL.camera })); cam.position.set(0, 0.04, 0.2); hand.add(cam);
-    const lens = new THREE.Mesh(new THREE.CylinderGeometry(0.05, 0.05, 0.05, 16),
+
+    // ── 手首カメラ（実機 DOFBOT と同じくグリッパ脇に載り、作業点を見下ろす）──
+    //   ハンドのローカル +Y は工具軸（A3=π なのでワールド真下）。
+    //   狙点は「把持点」ではなく「撮像姿勢のときに部品が居る所」= 把持点の HOVER 下。
+    //   撮像はホバー姿勢でしか行わないので、そこで部品が画面中心に来るのが正しい。
+    const tipY = GEO.L3 - 0.3 - 0.22;
+    const camPos = new THREE.Vector3(0, 0.05, 0.25);          // 手のひら(z<=0.14)の外側
+    const aim = new THREE.Vector3(0, tipY + L.HOVER, 0);      // 撮像時の部品位置
+    const d = aim.clone().sub(camPos);
+    const dn = d.clone().normalize();
+
+    const housing = new THREE.Mesh(new THREE.BoxGeometry(0.24, 0.16, 0.1),
+      new THREE.MeshStandardMaterial({ color: COL.camera }));
+    housing.position.copy(camPos); housing.rotation.x = Math.atan2(d.z, d.y);
+    const lens = new THREE.Mesh(new THREE.CylinderGeometry(0.045, 0.045, 0.05, 16),
       new THREE.MeshStandardMaterial({ color: COL.lens, emissive: 0x0e6b5f, emissiveIntensity: 0.7 }));
-    lens.rotation.x = Math.PI / 2; lens.position.set(0, 0.04, 0.28); hand.add(lens);
+    // 円柱の軸は既定で +Y。Rx(φ)(0,1,0)=(0,cosφ,sinφ) なので φ=atan2(d.z,d.y) で d 方向を向く
+    lens.position.copy(camPos).addScaledVector(dn, 0.06);
+    lens.rotation.x = Math.atan2(d.z, d.y);
+    // カメラ自身の筐体はレイヤ1へ退避。カメラは自分の中に居るので、レイヤを分けないと
+    // 筐体の内壁だけが写って画面が真っ暗になる（＝実際にそうなった）。
+    for (const m of [housing, lens]) { m.layers.set(1); hand.add(m); }
+    this.camera.layers.enable(1);        // 俯瞰カメラからは筐体が見える
+
+    this.wristCam = new THREE.PerspectiveCamera(WRIST.fov, 1, 0.04, 14);
+    this.wristCam.position.copy(camPos);
+    // Three のカメラはローカル -Z を向く。rotation.x=θ で -Z→(0, sinθ, -cosθ) なので
+    // θ = atan2(d.y, -d.z) で狙点方向を向く。
+    this.wristCam.rotation.x = Math.atan2(d.y, -d.z);
+    hand.add(this.wristCam);
 
     // ID6 グリッパ
     this.gripper = new THREE.Group(); hand.add(this.gripper);
     const palm = new THREE.Mesh(new THREE.BoxGeometry(0.4, 0.12, 0.28),
       new THREE.MeshStandardMaterial({ color: COL.bracket, metalness: 0.5 }));
     palm.position.y = 0.06; this.gripper.add(palm);
-    // 把持点。j4 からの距離が GEO.L3 と厳密に一致する（= IK が解く手先そのもの）
-    const tipY = GEO.L3 - 0.3 - 0.22;
+    // 把持点。j4 からの距離が GEO.L3 と厳密に一致する（= IK が解く手先そのもの。tipY は上で算出済み）
     this.gripTip = new THREE.Group();
     this.gripTip.position.y = tipY;
     this.gripper.add(this.gripTip);
@@ -361,33 +405,46 @@ export class LineSimulator {
     return n;
   }
 
-  // ── Pick & Place：全ポーズを逆運動学で解いて手順を組む ────────────────────
-  beginCycle(part, rack, slot, done) {
-    const S = { x: part.position.x, y: part.position.y, z: part.position.z };   // 実際の停止位置
+  // ── ①② 接近：撮像姿勢へ ───────────────────────────────────────────────
+  //   手首カメラで部品を見るには、まず部品の真上へ行く必要がある。
+  //   実機の手順どおり「見てから決める」ので、認識はここが終わってから走る。
+  beginApproach(part, done) {
+    const S = { x: part.position.x, y: part.position.y, z: part.position.z };
+    const ik = (x, y, z) => solveIK(x, y, z).q;
+    this.seq = [
+      { key: 'open',    type: 'grip', grip: 1, ms: T.open, label: '① グリッパを開く' },
+      { key: 'inspect', type: 'arm', q: ik(S.x, S.y + L.HOVER, S.z), ms: T.inspect,
+        label: '② 部品の真上へ移動（手首カメラで撮像）' },
+    ];
+    this.cycle = {
+      part, done, idx: 0, elapsed: 0, lastIdx: -1, stage: 'approach',
+      startQ: this.q.slice(), startGrip: this.grip,
+    };
+  }
+
+  // ── ③〜⑪ 把持して色の合った棚へ ────────────────────────────────────────
+  beginPickPlace(part, rack, slot, done) {
+    const S = { x: part.position.x, y: part.position.y, z: part.position.z };
     const P = slot.pos;
     const cs = L.polar(L.STATION_YAW, L.CARRY.u);
     const cr = L.polar(rack.yaw, L.CARRY.u);
     const ik = (x, y, z) => solveIK(x, y, z).q;
 
     this.seq = [
-      { key: 'open',    type: 'grip', grip: 1, ms: 0.30, label: '① グリッパを開く' },
-      { key: 'above',   type: 'arm', q: ik(S.x, S.y + L.HOVER, S.z), ms: 0.70, label: '② 部品の真上へ接近' },
-      { key: 'descend', type: 'arm', q: ik(S.x, S.y, S.z),           ms: 0.50, label: '③ 把持点まで下降' },
-      { key: 'grasp',   type: 'grip', grip: graspT(part.userData.half), ms: 0.45, grab: true, label: '④ 把持：指が部品に接するまで閉じる' },
-      { key: 'lift',    type: 'arm', q: ik(cs.x, L.CARRY.y, cs.z),   ms: 0.60, label: '⑤ 持ち上げて引き込む' },
-      { key: 'swing',   type: 'arm', q: ik(cr.x, L.CARRY.y, cr.z),   ms: 1.00, label: `⑥ ${rack.label} へベース旋回` },
-      { key: 'over',    type: 'arm', q: ik(P.x, P.y + L.HOVER, P.z), ms: 0.70, label: '⑦ スロット真上へ' },
-      { key: 'place',   type: 'arm', q: ik(P.x, P.y, P.z),           ms: 0.50, label: '⑧ スロットへ下降' },
-      { key: 'release', type: 'grip', grip: 1, ms: 0.40, release: true, label: '⑨ 解放：棚へ置く' },
-      { key: 'retreat', type: 'arm', q: ik(P.x, P.y + L.HOVER, P.z), ms: 0.45, label: '⑩ 退避' },
-      { key: 'home',    type: 'arm', q: this.HOME, ms: 0.70, label: '⑪ ホームへ戻る' },
+      { key: 'descend', type: 'arm', q: ik(S.x, S.y, S.z),           ms: T.descend, label: '③ 把持点まで下降' },
+      { key: 'grasp',   type: 'grip', grip: graspT(part.userData.half), ms: T.grasp, grab: true, label: '④ 把持：指が部品に接するまで閉じる' },
+      { key: 'lift',    type: 'arm', q: ik(cs.x, L.CARRY.y, cs.z),   ms: T.lift,    label: '⑤ 持ち上げて引き込む' },
+      { key: 'swing',   type: 'arm', q: ik(cr.x, L.CARRY.y, cr.z),   ms: T.swing,   label: `⑥ ${rack.label} へベース旋回` },
+      { key: 'over',    type: 'arm', q: ik(P.x, P.y + L.HOVER, P.z), ms: T.over,    label: '⑦ スロット真上へ' },
+      { key: 'place',   type: 'arm', q: ik(P.x, P.y, P.z),           ms: T.place,   label: '⑧ スロットへ下降' },
+      { key: 'release', type: 'grip', grip: 1, ms: T.release, release: true,        label: '⑨ 解放：棚へ置く' },
+      { key: 'retreat', type: 'arm', q: ik(P.x, P.y + L.HOVER, P.z), ms: T.retreat, label: '⑩ 退避' },
+      { key: 'home',    type: 'arm', q: this.HOME, ms: T.home,                      label: '⑪ ホームへ戻る' },
     ];
     this.cycle = {
-      part, rack, slot, done, idx: 0, elapsed: 0, lastIdx: -1,
+      part, rack, slot, done, idx: 0, elapsed: 0, lastIdx: -1, stage: 'pickplace',
       startQ: this.q.slice(), startGrip: this.grip, graspErr: null,
     };
-    part.userData.onBelt = false;
-    if (this.stationPart === part) this.stationPart = null;
     slot.part = part;                     // 予約（他の部品が同じ枠を取らない）
     slot.ring.material.opacity = 1; slot.mark.material.opacity = 0.55;   // 目標スロットを点灯
   }
@@ -408,6 +465,10 @@ export class LineSimulator {
         c.graspErr = this.tipWorld().distanceTo(c.part.position);
         this.gripTip.attach(c.part);      // ワールド変換を保ったままハンドの子にする
         this.held = c.part;
+        // ここでベルトを離れる。以降 position はハンド基準になるので、
+        // これより後に advanceBelt の対象にすると座標系が混ざって壊れる。
+        c.part.userData.onBelt = false;
+        if (this.stationPart === c.part) this.stationPart = null;
       }
       if (step.release && t >= 1 && this.held) {
         this.scene.attach(this.held);     // ワールド変換を保ったままシーンへ戻す
@@ -420,9 +481,9 @@ export class LineSimulator {
     if (t >= 1) {
       c.idx++; c.elapsed = 0; c.startQ = this.q.slice(); c.startGrip = this.grip;
       if (c.idx >= this.seq.length) {
-        const { done, graspErr, placeErr, part, rack } = c;
+        const { done, graspErr, placeErr, part, rack, stage } = c;
         this.cycle = null;
-        done?.({ graspErr, placeErr, part, rack });
+        done?.({ graspErr, placeErr, part, rack, stage });
       }
     }
   }
@@ -462,12 +523,49 @@ export class LineSimulator {
     this.camera.aspect = w / h; this.camera.updateProjectionMatrix(); this.renderer.setSize(w, h);
   }
 
+  // ── 手首カメラの 1 フレーム ─────────────────────────────────────────────
+  //   実際にレンダリングした画素を返す。camera_grab() の実体であり、
+  //   PiP 表示にも TinyML 推論にも「この同じ配列」を使う。
+  //   WebGL の読み出しは下から上なので Y を反転して画像の並びに直す。
+  grabWristFrame(clean = false) {
+    const n = WRIST.res;
+    this.renderer.setRenderTarget(this.wristRT);
+    this.renderer.render(this.scene, this.wristCam);
+    this.renderer.readRenderTargetPixels(this.wristRT, 0, 0, n, n, this.wristPixels);
+    this.renderer.setRenderTarget(null);
+    const out = new Uint8ClampedArray(n * n * 4);
+    for (let y = 0; y < n; y++) {
+      const src = (n - 1 - y) * n * 4, dst = y * n * 4;
+      out.set(this.wristPixels.subarray(src, src + n * 4), dst);
+    }
+    if (!clean) this.applyCameraModel(out);
+    return { res: n, rgba: out };
+  }
+
+  // 実機カメラの劣化を再現。1 フレームごとに露出とホワイトバランスが揺れ、
+  // 画素にはセンサノイズが乗る。表示も推論もこの劣化後の画素を使う。
+  applyCameraModel(rgba) {
+    const N = WRIST.noise, R = this.rand;
+    const gain = N.gain[0] + R() * (N.gain[1] - N.gain[0]);
+    const wb = [0, 1, 2].map(() => N.wb[0] + R() * (N.wb[1] - N.wb[0]));
+    for (let i = 0; i < rgba.length; i += 4) {
+      for (let c = 0; c < 3; c++) {
+        // Box-Muller で正規ノイズ（実機のショットノイズ相当）
+        const u = Math.max(1e-9, R()), v = R();
+        const g = Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+        rgba[i + c] = Math.max(0, Math.min(255, rgba[i + c] * gain * wb[c] + g * N.sigma));
+      }
+    }
+  }
+
   renderLoop(callback) {
     const clock = new THREE.Clock();
     const frame = () => {
       requestAnimationFrame(frame);
       const dt = Math.min(clock.getDelta(), 0.05);
-      callback?.(dt); this.update(dt); this.controls.update(); this.renderer.render(this.scene, this.camera);
+      callback?.(dt); this.update(dt); this.controls.update();
+      this.renderer.setRenderTarget(null);
+      this.renderer.render(this.scene, this.camera);
     };
     frame();
   }

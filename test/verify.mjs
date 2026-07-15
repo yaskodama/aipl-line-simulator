@@ -1,6 +1,6 @@
 import puppeteer from 'puppeteer';
 
-const URL = 'http://127.0.0.1:8022/index.html?auto';
+const URL = process.env.URL ?? 'http://127.0.0.1:8022/index.html?auto';
 const RUN_MS = Number(process.env.RUN_MS ?? 60000);
 
 const browser = await puppeteer.launch({
@@ -24,8 +24,8 @@ await page.evaluate(() => {
   window.__rec = { grasps: [], places: [], ships: [], maxTipErr: 0, phases: new Set(), servoFaults: [], servoMin: [999,999,999,999,999,999], servoMax: [-999,-999,-999,-999,-999,-999] };
   simulator.onServoFault = ids => window.__rec.servoFaults.push(ids.join(','));
   simulator.onServo = a => a.forEach((v, i) => { window.__rec.servoMin[i] = Math.min(window.__rec.servoMin[i], v); window.__rec.servoMax[i] = Math.max(window.__rec.servoMax[i], v); });
-  const origBegin = simulator.beginCycle.bind(simulator);
-  simulator.beginCycle = (part, rack, slot, done) => origBegin(part, rack, slot, res => {
+  const origBegin = simulator.beginPickPlace.bind(simulator);
+  simulator.beginPickPlace = (part, rack, slot, done) => origBegin(part, rack, slot, res => {
     window.__rec.grasps.push(res.graspErr);
     window.__rec.places.push({
       partColor: res.part.userData.color, rackColor: res.rack.color, err: res.placeErr,
@@ -69,6 +69,8 @@ const R = await page.evaluate(() => {
       dist: s.part.getWorldPosition(new s.part.position.constructor())
         .distanceTo(new s.part.position.constructor(s.pos.x, s.pos.y, s.pos.z)),
     }))),
+    vision: { seen: stats().seen, correct: stats().correct },
+    modelLoaded: !!window.__sim.model(),
     pcResolved: document.getElementById('pcLine').textContent,
     servoText: [...document.querySelectorAll('.sv')].slice(0, 6).map(e => e.textContent),
   };
@@ -103,7 +105,13 @@ console.log(`棚に残る部品          : ${R.shelfCheck.length} 個 / 色違�
 if (shelfBad.length) fail.push(`棚に色違いの部品がある: ${JSON.stringify(shelfBad)}`);
 if (shelfOff.length) fail.push(`棚の部品がスロットからずれている: ${JSON.stringify(shelfOff)}`);
 
-const want = ['open','above','descend','grasp','lift','swing','over','place','release','retreat','home'];
+// TinyML の認識精度（誤認識すると本当に違う色の棚へ運ばれる）
+console.log(`TinyML 認識          : ${R.vision.correct}/${R.vision.seen} 正解` + (R.vision.seen ? ` (${(100*R.vision.correct/R.vision.seen).toFixed(1)}%)` : ''));
+if (!R.modelLoaded) fail.push('TinyML モデルが読み込まれていない');
+if (R.vision.seen === 0) fail.push('一度も撮像・認識していない');
+if (R.vision.seen && R.vision.correct < R.vision.seen) fail.push(`誤認識 ${R.vision.seen - R.vision.correct} 件`);
+
+const want = ['open','inspect','descend','grasp','lift','swing','over','place','release','retreat','home'];
 const missing = want.filter(w => !R.phases.includes(w));
 console.log(`Pick&Place フェーズ   : ${R.phases.length}/${want.length} 実行`);
 if (missing.length) fail.push(`未実行のフェーズ: ${missing.join(',')}`);
