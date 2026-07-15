@@ -34,10 +34,9 @@ export class LineSimulator {
     this.spawnTimer = 0;
     this.cycle = null;
     this.held = null;                 // 把持中の部品
-    this.onStationReady = null;       // 部品がストッパで停止した
     this.onPhase = null;              // AIPL のどの行を実行中か
     this.onServo = null;              // サーボ指令角
-    this.onReject = null;
+    this.onServoFault = null;         // 可動域を超えた指令が出た
     this.q = [0, 0, 0, 0, 0];
     this.qPrev = [0, 0, 0, 0, 0];
     this.grip = 1;
@@ -322,8 +321,9 @@ export class LineSimulator {
       const nx = p.position.x + dt * 0.85 * this.speed;
       p.position.x = Math.min(nx, limit);
       if (i === 0 && !p.userData.stopped && p.position.x >= L.STATION.x - 1e-6) {
+        // ストッパ位置に到達 → アームが空くまでここで待つ（main.js が拾う）
         p.position.x = L.STATION.x; p.userData.stopped = true;
-        this.stationPart = p; this.onStationReady?.(p);      // アームへ通知
+        this.stationPart = p;
       }
     });
     // 不良品はストッパを開放してベルト端から排出

@@ -4,7 +4,7 @@ import * as L from './layout.js';
 
 const ui = Object.fromEntries(
   ['processed','success','failed','graspErr','messages','statusBadge','log','actorGrid','sourceView',
-   'srcTarget','speed','cameraFault','shelfPanel','pcActor','pcLine','follow','servoPanel']
+   'srcTarget','speed','cameraFault','shelfPanel','pcActor','pcLine','follow']
     .map(id => [id, document.getElementById(id)]));
 const simulator = new LineSimulator(document.getElementById('scene'));
 let stats = { processed:0, success:0, failed:0, graspErr:0 };
