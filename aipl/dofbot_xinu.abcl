@@ -100,7 +100,7 @@ class Kinematics {
 
   // 引込搬送姿勢のワールド座標。旋回中に棚や既設部品と干渉しない高さまで上げる。
   method carry_pose(yaw) !{net} {
-    var u = 0.75;  var y = 1.90;
+    var u = 0.722;  var y = 1.539;
     reply([(0.0 - u) * cos(yaw), y, u * sin(yaw)]);
   }
 
@@ -171,8 +171,8 @@ class PlannerActor {
   var shelf  = 0;
   // 作業セルの座標（src/layout.js と同一）
   var STX = 0.0 - 0.832;  var STY = 0.90;  var STZ = 0.0 - 1.188;   // コンベア停止位置
-  var HOVER = 0.40;
-  var CARRY_U = 0.75;     var CARRY_Y = 1.90;
+  var HOVER = 0.239;
+  var CARRY_U = 0.722;     var CARRY_Y = 1.539;
 
   method wire(k, mv, c, cam, r, sh) !{mut, net} {
     kin = k; mover = mv; claw = c; camera = cam; recog = r; shelf = sh; reply(1);
@@ -183,11 +183,11 @@ class PlannerActor {
   // 別アクター Kinematics 側に置き、`now kin.xxx()` で呼ぶ。
   method run_one() !{ai, fs, net} {
     // ① グリッパを開く
-    var r0 = now claw.write(180, 300);
+    var r0 = now claw.write(180, 195);
 
     // ② 部品の真上へ（撮像姿勢）。ここまで来ないと手首カメラは部品を見られない。
     var qa = now kin.solve(STX, STY + HOVER, STZ);
-    var r1 = now mover.to(qa, 700);
+    var r1 = now mover.to(qa, 380);
 
     // 撮像 → TinyML 認識 → 置くべき棚を決める
     var frame = now camera.capture();
@@ -205,31 +205,31 @@ class PlannerActor {
 
     // ③ 把持点まで下降
     var qg = now kin.solve(STX, STY, STZ);
-    var r2 = now mover.to(qg, 500);
+    var r2 = now mover.to(qg, 130);
     // ④ 把持（部品幅ぶんだけ閉じる）
-    var r3 = now claw.write(105, 450);
+    var r3 = now claw.write(105, 195);
     // ⑤ 持ち上げて引き込む
     var cp = now kin.carry_pose(0.0 - 0.9599311);        // コンベア方向 -55 度
     var cs = now kin.solve(cp[0], cp[1], cp[2]);
-    var r4 = now mover.to(cs, 600);
+    var r4 = now mover.to(cs, 364);
     // ⑥ 棚の方向へベース旋回
     var ry = now kin.rack_yaw(cls);
     var cq = now kin.carry_pose(ry);
     var cr = now kin.solve(cq[0], cq[1], cq[2]);
-    var r5 = now mover.to(cr, 1000);
+    var r5 = now mover.to(cr, 1631);
     // ⑦ スロット真上へ
     var qo = now kin.solve(P[0], P[1] + HOVER, P[2]);
-    var r6 = now mover.to(qo, 700);
+    var r6 = now mover.to(qo, 425);
     // ⑧ スロットへ下降
     var qp = now kin.solve(P[0], P[1], P[2]);
-    var r7 = now mover.to(qp, 500);
+    var r7 = now mover.to(qp, 143);
     // ⑨ 解放：棚へ置く
-    var r8 = now claw.write(180, 400);
+    var r8 = now claw.write(180, 198);
     // ⑩ 退避
-    var r9 = now mover.to(qo, 450);
+    var r9 = now mover.to(qo, 141);
     // ⑪ ホームへ戻る
     var qh = now kin.solve(0.0 - 1.0805, 1.75, 0.0 - 0.3933);
-    var ra = now mover.to(qh, 700);
+    var ra = now mover.to(qh, 1363);
 
     write_file("cycle.log", "shelf " + cls + " slot " + slot);     // 永続化 → fs
     reply(cls);

@@ -52,16 +52,16 @@ export const RACKS = [
 ];
 
 // ── 動作の高さ ────────────────────────────────────────────────────────────
-export const HOVER = 0.40;               // 把持/設置の直上に構える高さ
-export const CARRY = { u: 0.75, y: 1.90 };  // 搬送時は基部近くへ引き込んで高く保持
+export const HOVER = 0.239;               // 把持/設置の直上に構える高さ
+export const CARRY = { u: 0.722, y: 1.539 };  // 搬送時は基部近くへ引き込んで高く保持
                                             // → 旋回中に棚や既設部品と絶対に干渉しない
 
 // ── 各フェーズの所要時間[秒] ──────────────────────────────────────────────
-// 強化学習 (rl/dofbot_rl.py) が最適化して書き戻す対象。既定値は手調整のベースライン。
+// 強化学習 (rl/dofbot_rl.py) が学習した方策。6.30秒 → 5.16秒。手で書き換えず python3 rl/apply_policy.py で更新すること。
 // HOVER / CARRY も方策パラメータなので、ここを変えたら必ず test/cell.mjs を通すこと。
 export const T = {
-  open: 0.30, inspect: 0.70, descend: 0.50, grasp: 0.45, lift: 0.60, swing: 1.00,
-  over: 0.70, place: 0.50, release: 0.40, retreat: 0.45, home: 0.70,
+  open: 0.195, inspect: 0.380, descend: 0.130, grasp: 0.195, lift: 0.363, swing: 1.631,
+  over: 0.425, place: 0.143, release: 0.198, retreat: 0.141, home: 1.363,
 };
 export const CYCLE_SEC = Object.values(T).reduce((a, b) => a + b, 0);
 

@@ -1,0 +1,23 @@
+{
+  "carry_u": 0.7223,
+  "carry_y": 1.5388,
+  "hover": 0.2388,
+  "T": {
+    "open": 0.195,
+    "inspect": 0.3802,
+    "descend": 0.1303,
+    "grasp": 0.1946,
+    "lift": 0.3635,
+    "swing": 1.6308,
+    "over": 0.4246,
+    "place": 0.1427,
+    "release": 0.1981,
+    "retreat": 0.1411,
+    "home": 1.3629
+  },
+  "cycle_sec": 5.1639,
+  "baseline_sec": 6.3,
+  "violation": 0.0,
+  "lower_bound_sec": 3.9044,
+  "generations": 120
+}
