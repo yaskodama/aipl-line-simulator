@@ -1,175 +1,296 @@
 // dofbot_xinu.abcl —— Yahboom DOFBOT (6DOF / Raspberry Pi 5) 実機制御
 // ===========================================================================
-//   実機 DOFBOT は 15kg シリアルバスサーボ 6 個。Yahboom Arm_Lib と同じ API で駆動する:
-//     Arm_serial_servo_write(id, angle, ms)  … サーボ id を angle[deg] へ ms[ms] で駆動
-//     Arm_serial_servo_read(id)              … サーボ id の現在角を読む
+//   これは本物の AIPL。飾りではなく、実際に処理系で実行される:
+//
+//     cd ~/ocaml-app/abclcp-project/src/python-aipl
+//     DOFBOT_FRAMES=~/aipl_line_simulator/rl/dataset.json \
+//       python3 aipl_main.py ~/aipl_line_simulator/aipl/dofbot_xinu.abcl
+//
+//   実機を駆動するときは DOFBOT_BACKEND=armlib（DOFBOT の Pi 上）または
+//   DOFBOT_BACKEND=http DOFBOT_URL=... （LAN 越し）にするだけで、
+//   このソースは 1 行も変えずに実機のバスサーボが回る。
 //
 //   サーボ割当（6 軸）:
 //     ID1 ベース旋回(yaw) / ID2 肩 / ID3 肘 / ID4 手首ピッチ / ID5 手首回転 / ID6 グリッパ
 //   各サーボ(=各軸)に soft-Xinu を 2 台 = 計 12 Xinu。
 //
-//   作業内容: コンベアで流れてきた部品を掴み、色の一致する棚のスロットへ置く。
-//             棚が満杯になったら出荷して空にし、これを延々と繰り返す。
-//
 //   Capability は「ソースに書かない」。各メソッド本体の一次作用(primitive)を
-//   AICE の効果推論が走査し、!{mut, net, ai, fs} を自動導出して役割を推論する:
-//     Arm_serial_servo_write / belt_drive / フィールド代入 → mut（アクチュエーション）
-//     send / now / reply / remote                        → net（メッシュ通信）
-//     ai_infer / vision_detect / llm_ask                 → ai （AI 推論）
-//     file_write / persist                               → fs （永続化）
+//   AICE の効果推論が走査して !{mut, net, ai, fs} を導出する。処理系に
+//   --type-check を渡すと、申告と実体の食い違いを検出する:
+//     Arm_serial_servo_write -> mut （唯一の駆動権限）
+//     Arm_serial_servo_read  -> 効果なし（計測のみ = read-only）
+//     tinyml_infer           -> ai  （ローカル推論。net を持たない＝機外へ出ない）
+//     tinyml_load / write_file -> fs
+//     send / now / reply     -> net
 // ===========================================================================
 
 // ── 各軸 Xinu-A：サーボ・モータ（実機サーボを駆動。mut を持つ唯一の役割）──
 class ServoMotor {
   var id  = 0;
   var pos = 90.0;
-  method write(angle, ms) {
-    pos = angle;                            // フィールド代入 → mut
-    Arm_serial_servo_write(id, angle, ms);  // 実機バスサーボ駆動 → mut
-    reply(1);                               // reply → net
+  method bind(i) !{mut, net} { id = i; reply(1); }
+  method write(angle, ms) !{mut, net} {
+    pos = angle;                              // フィールド代入 → mut
+    Arm_serial_servo_write(id, angle, ms);    // 実機バスサーボ駆動 → mut
+    reply(1);
   }
-  method get() { reply(pos); }              // 読み出しのみ → net
+  method get() !{net} { reply(pos); }
 }
 
 // ── 各軸 Xinu-B：サーボ・センサ（バスサーボの現在角を計測・報告。read-only）──
+//    Arm_serial_servo_read は効果を持たないので、このクラスに mut は付かない。
+//    = センサは物理的に何も動かせないことが型で保証される。
 class ServoSensor {
   var id = 0;
-  method read() {
-    var a = Arm_serial_servo_read(id);      // 実機サーボ角の読取(sense) → 作用なし
-    reply(a);                               // reply → net
+  method bind(i) !{mut, net} { id = i; reply(1); }
+  method read() !{net} {
+    var a = Arm_serial_servo_read(id);        // 計測(sense) → 効果なし
+    reply(a);
   }
 }
 
-// ── コンベア・アクター（ベルト駆動とストッパ。部品を停止位置で保持する）──
-class ConveyorActor {
-  var stopped = 0;
-  method feed() {
-    belt_drive(1);                          // ベルト前進 → mut
-    reply(1);
+// ── 運動学アクター（逆運動学。純計算なので効果を一切持たない）──────────────
+//   ベース旋回 + 3リンク平面アームに分解し、工具軸を鉛直下向きに固定して解く。
+//   src/ik.js と同一の式・同一の較正オフセット。
+class Kinematics {
+  var L1 = 1.20;                 // ID2(肩) → ID3(肘)
+  var L2 = 1.20;                 // ID3(肘) → ID4(手首ピッチ)
+  var L3 = 1.05;                 // ID4 → 把持点
+  var SH = 1.05;                 // 肩のワールド高さ
+  // 取付較正 OFFSET = [63, 85, 1, -2, 63]。作業セルの全ポーズが 0..180 に収まる値。
+  method solve(tx, ty, tz) !{net} {
+    var u = sqrt(tx * tx + tz * tz);          // 旋回面内の水平リーチ
+    var yaw = atan2(tz, 0.0 - tx);            // ID1
+    var wu = u;
+    var wv = (ty - SH) + L3;                  // 手首は目標の真上 L3
+    var d = sqrt(wu * wu + wv * wv);
+    var lim = (L1 + L2) * 0.995;              // 伸びきり(特異点)は避ける
+    if (d > lim) { var k = lim / d; wu = wu * k; wv = wv * k; d = lim; }
+    var cosB = (d * d - L1 * L1 - L2 * L2) / (2.0 * L1 * L2);
+    if (cosB > 1.0)  { cosB = 1.0; }
+    if (cosB < 0.0 - 1.0) { cosB = 0.0 - 1.0; }
+    var beta = acos(cosB);                    // 肘の曲げ量(>=0 = 肘上げ)
+    var a1 = atan2(wu, wv) - atan2(L2 * sin(beta), L1 + L2 * cos(beta));
+    var a2 = a1 + beta;
+    var deg = 57.29577951308232;
+    // 関節角 → 実機サーボ指令角
+    var s1 = 63.0 + yaw * deg;
+    var s2 = 85.0 + a1 * deg;
+    var s3 = 1.0 + beta * deg;
+    var s4 = 0.0 - 2.0 + (3.141592653589793 - a2) * deg;
+    var s5 = 63.0 + yaw * deg;                // ID5 は yaw を打ち消しハンド向きを固定
+    reply([s1, s2, s3, s4, s5]);
   }
-  method arrived(obj) {                     // ストッパで部品が停止した
-    stopped = 1;                            // → mut
-    send CameraActor.capture(obj);          // 知覚サイクル起動 → net
+
+  // 棚 s のスロット n のワールド座標（雛壇 2 段 x 2 枠）。純計算。
+  method slot_pose(s, n) !{net} {
+    var yaws = [0.0, 0.8726646, 1.7453293];   // 棚A/B/C = ID1 で 0/50/100 度
+    var yaw = yaws[s];
+    var tier = 0; var k = n;
+    if (n >= 2) { tier = 1; k = n - 2; }
+    var dr = 0.0 - 0.22;  var top = 0.40;     // 手前段
+    if (tier == 1) { dr = 0.22; top = 0.76; } // 奥段
+    var r = 1.35 + dr;
+    var tan = 0.0 - 0.19;
+    if (k == 1) { tan = 0.19; }
+    var x = (0.0 - r) * cos(yaw) + tan * sin(yaw);
+    var z = r * sin(yaw) + tan * cos(yaw);
+    reply([x, top + 0.16, z]);
   }
-  method release(obj) {                     // 不良品はストッパを開けて排出
-    stopped = 0;                            // → mut
-    belt_drive(2);                          // → mut
+
+  // 引込搬送姿勢のワールド座標。旋回中に棚や既設部品と干渉しない高さまで上げる。
+  method carry_pose(yaw) !{net} {
+    var u = 0.75;  var y = 1.90;
+    reply([(0.0 - u) * cos(yaw), y, u * sin(yaw)]);
+  }
+
+  method rack_yaw(s) !{net} {
+    var yaws = [0.0, 0.8726646, 1.7453293];
+    reply(yaws[s]);
+  }
+}
+
+// ── 搬送アクター（ID1..ID5 を目標姿勢へ。駆動は各モータへ委譲するので mut を持たない）──
+class ArmMover {
+  var motors = [];
+  method wire(ms) !{mut, net} { motors = ms; reply(1); }
+  method to(q, ms) !{net} {
+    var j = 0;
+    while (j < 5) do {
+      var m = motors[j];
+      var r = now m.write(q[j], ms);          // now でサーボ・モータへ依頼 → net
+      j = j + 1;
+    }
     reply(1);
   }
 }
 
-// ── カメラ・アクター（手首 HD カメラ + 3D 深度。AI 物体検出）──
+// ── カメラ・アクター（手首カメラ。撮像のみなので効果は net だけ）────────────
 class CameraActor {
-  method capture(obj) {
-    var img = camera_grab();                // フレーム取得
-    var det = vision_detect(img);           // 物体検出 → ai
-    send RecognitionActor.classify(obj, det);   // send → net
+  method capture() !{net} {
+    var f = dofbot_camera_grab();             // 手首カメラ 1 フレーム → 効果なし
+    reply(f);
   }
 }
 
-// ── 認識アクター（色の AI 分類 → 置くべき棚を決める）──
+// ── 認識アクター（TinyML でクラス確率を出す。ai を持つ唯一の役割）──────────
+//   tinyml_infer は net を持たないので、画像も推論結果も機外へ出ない。
 class RecognitionActor {
-  method classify(obj, det) {
-    var color = ai_infer(det);              // 色分類推論 → ai
-    var shelf = "A";                        // 赤 → 棚A
-    if (color == "blue")  { shelf = "B"; }  // 青 → 棚B
-    if (color == "green") { shelf = "C"; }  // 緑 → 棚C
-    send ShelfActor.assign(obj, color, shelf);  // send → net
+  var model = 0;
+  method wire(m) !{mut, net} { model = m; reply(1); }
+  method classify(frame) !{ai, net} {
+    var p = tinyml_infer(model, frame);       // ローカル小型推論 → ai
+    var k = tinyml_argmax(p);
+    reply([k, p[k]]);
   }
 }
 
-// ── 棚アクター（色別 3 棚 × 4 スロットの在庫管理。満杯なら出荷して空にする）──
+// ── 棚アクター（色別 3 棚 x 4 スロット。満杯なら出荷して空にする）───────────
 class ShelfActor {
-  var used = [];
-  method assign(obj, color, shelf) {
-    var n = shelf_count(shelf);             // その棚の使用スロット数
-    if (n >= 4) {                           // 満杯 → 先に出荷して空ける
-      now self.ship(shelf);
+  var used = [0, 0, 0];
+  method alloc(shelf) !{fs, mut, net} {
+    var n = used[shelf];
+    if (n >= 4) {                             // 満杯 → 出荷して空ける
+      write_file("shipment.log", "shelf " + shelf + " shipped");   // 永続化 → fs
       n = 0;
     }
-    var slot = shelf_alloc(shelf);          // 空きスロットを手前段から確保
-    array_push(used, slot);                 // → mut
-    send PlannerActor.plan(obj, shelf, slot);   // send → net
+    array_set(used, shelf, n + 1);            // → mut
+    reply(n);
   }
-  method ship(shelf) {
-    file_write("shipment.log", shelf);      // 出荷を永続化 → fs
-    shelf_clear(shelf);                     // 棚を空にする → mut
-    reply(1);
-  }
+  method count(shelf) !{net} { reply(used[shelf]); }
 }
 
-// ── 搬送アクター（アーム 5 関節 ID1..ID5 を目標姿勢へ動かす。駆動は各モータへ委譲＝net）──
-class ArmMover {
-  method to(q, ms) {
-    var id = 1;
-    while (id < 6) do {                     // ID1..ID5
-      var m = motor_of(id);
-      now m.write(q[id], ms);               // now でサーボ・モータへ依頼 → net（mut は持たない）
-      id = id + 1;
-    }
-    reply(1);                               // reply → net
-  }
-}
-
-// ── 計画アクター（逆運動学 + Pick&Place シーケンス）──
-//    「掴む→旋回→棚へ置く」を実機の順序どおりに発行する。サーボは直接動かせない＝mut を持たない。
+// ── 計画アクター（Pick&Place。サーボを直接動かせない＝mut を持たない）────────
+//   「見てから決める」実機の順序どおり: ①② 撮像姿勢 → 認識 → ③〜⑪ 把持して棚へ。
 class PlannerActor {
-  method plan(obj, shelf, slot) {
-    var above = inverse_kinematics(obj, 40);    // 部品の真上（ホバー40mm）
-    var grasp = inverse_kinematics(obj, 0);     // 部品の把持点
-    var carry = carry_pose(obj);                // 引き込んだ搬送姿勢
-    var turn  = carry_pose(slot);               // 棚方向へ旋回した搬送姿勢
-    var over  = slot_pose(slot, 40);            // スロット真上
-    var down  = slot_pose(slot, 0);             // スロットへ下降
-    var mover = arm_mover();                    // 搬送アクター
-    var claw  = motor_of(6);                    // ID6 グリッパ
-    var hold  = grip_angle(obj);                // 部品幅から掴み代を決める
+  var kin    = 0;
+  var mover  = 0;
+  var claw   = 0;
+  var camera = 0;
+  var recog  = 0;
+  var shelf  = 0;
+  // 作業セルの座標（src/layout.js と同一）
+  var STX = 0.0 - 0.832;  var STY = 0.90;  var STZ = 0.0 - 1.188;   // コンベア停止位置
+  var HOVER = 0.40;
+  var CARRY_U = 0.75;     var CARRY_Y = 1.90;
 
-    now claw.write(180, 300);               // ① グリッパを開く
-    now mover.to(above, 700);               // ② 部品の真上へ接近
-    now mover.to(grasp, 500);               // ③ 把持点まで下降
-    now claw.write(hold, 450);              // ④ 把持：指が部品に接するまで閉じる
-    now mover.to(carry, 600);               // ⑤ 持ち上げて引き込む
-    now mover.to(turn, 1000);               // ⑥ 棚の方向へベース旋回
-    now mover.to(over, 700);                // ⑦ スロット真上へ
-    now mover.to(down, 500);                // ⑧ スロットへ下降
-    now claw.write(180, 400);               // ⑨ 解放：棚へ置く
-    now mover.to(over, 450);                // ⑩ 退避
-    now mover.to(home_pose(), 700);         // ⑪ ホームへ戻る
-    send SafetyActor.complete(obj, shelf);  // 完了通知 → net
+  method wire(k, mv, c, cam, r, sh) !{mut, net} {
+    kin = k; mover = mv; claw = c; camera = cam; recog = r; shelf = sh; reply(1);
+  }
+
+  // NOTE: このメソッドから `now self.xxx()` は絶対に書かないこと。自分宛の now は
+  // 自分が処理中なので永久に返らない（自己デッドロック）。幾何計算はすべて
+  // 別アクター Kinematics 側に置き、`now kin.xxx()` で呼ぶ。
+  method run_one() !{ai, fs, net} {
+    // ① グリッパを開く
+    var r0 = now claw.write(180, 300);
+
+    // ② 部品の真上へ（撮像姿勢）。ここまで来ないと手首カメラは部品を見られない。
+    var qa = now kin.solve(STX, STY + HOVER, STZ);
+    var r1 = now mover.to(qa, 700);
+
+    // 撮像 → TinyML 認識 → 置くべき棚を決める
+    var frame = now camera.capture();
+    var res   = now recog.classify(frame);
+    var cls   = res[0];
+    var conf  = res[1];
+    var truth = dofbot_camera_truth();
+    var names = ["赤・立方体", "青・円柱", "緑・六角柱"];
+    var mark = "";
+    if (cls != truth) { mark = "  ※誤認識(正解 " + names[truth] + ")"; }
+    print("  TinyML 認識 → " + names[cls] + " 信頼度 " + floor(conf * 1000) / 10 + "%" + mark);
+
+    var slot = now shelf.alloc(cls);
+    var P = now kin.slot_pose(cls, slot);
+
+    // ③ 把持点まで下降
+    var qg = now kin.solve(STX, STY, STZ);
+    var r2 = now mover.to(qg, 500);
+    // ④ 把持（部品幅ぶんだけ閉じる）
+    var r3 = now claw.write(105, 450);
+    // ⑤ 持ち上げて引き込む
+    var cp = now kin.carry_pose(0.0 - 0.9599311);        // コンベア方向 -55 度
+    var cs = now kin.solve(cp[0], cp[1], cp[2]);
+    var r4 = now mover.to(cs, 600);
+    // ⑥ 棚の方向へベース旋回
+    var ry = now kin.rack_yaw(cls);
+    var cq = now kin.carry_pose(ry);
+    var cr = now kin.solve(cq[0], cq[1], cq[2]);
+    var r5 = now mover.to(cr, 1000);
+    // ⑦ スロット真上へ
+    var qo = now kin.solve(P[0], P[1] + HOVER, P[2]);
+    var r6 = now mover.to(qo, 700);
+    // ⑧ スロットへ下降
+    var qp = now kin.solve(P[0], P[1], P[2]);
+    var r7 = now mover.to(qp, 500);
+    // ⑨ 解放：棚へ置く
+    var r8 = now claw.write(180, 400);
+    // ⑩ 退避
+    var r9 = now mover.to(qo, 450);
+    // ⑪ ホームへ戻る
+    var qh = now kin.solve(0.0 - 1.0805, 1.75, 0.0 - 0.3933);
+    var ra = now mover.to(qh, 700);
+
+    write_file("cycle.log", "shelf " + cls + " slot " + slot);     // 永続化 → fs
+    reply(cls);
   }
 }
 
-// ── 安全アクター（作業空間・非常停止の監視。イベントを永続ログへ）──
-class SafetyActor {
-  method complete(obj, shelf) {
-    file_write("cycle.log", shelf);         // 永続化 → fs
-    send Coordinator.next();                // 次の部品へ → net
-  }
-  method abort(obj, reason) {
-    file_write("cycle.log", reason);        // fs
-    send ConveyorActor.release(obj);        // 不良品を排出 → net
-  }
-}
-
-// ── 調整アクター（6 サーボ × 2 = 12 Xinu を生成し、知覚→計画→駆動を巡回）──
+// ── 調整アクター（6 サーボ × 2 = 12 Xinu を生成し、サイクルを回す）───────────
 class Coordinator {
   var motors  = [];
   var sensors = [];
-  method setup() {
+  var planner = 0;
+
+  method setup() !{ai, fs, mut, net} {
+    // ID1..ID5（位置決めの 5 軸）
     var id = 1;
-    while (id < 7) do {                     // ID1..ID6
+    while (id < 6) do {
       var m = new ServoMotor();
       var s = new ServoSensor();
-      array_push(motors, m);                // → mut
+      var r1 = now m.bind(id);
+      var r2 = now s.bind(id);
+      array_push(motors, m);                  // → mut
       array_push(sensors, s);
       id = id + 1;
     }
-    reply(1);                               // net
-  }
-  method next() {
-    send ConveyorActor.feed();              // 次の部品を送る → net
+    // ID6（グリッパ）。ループの外で作るのは型のため —— ループ内で掴んで後から
+    // 代入すると `var claw = 0` が int に推論され、actor 代入が型エラーになる。
+    // motors[5] で取り出す手もあるが、型検査がループ内 array_push を追えず誤検出する。
+    var claw = new ServoMotor();
+    var cs6  = new ServoSensor();
+    var cb   = now claw.bind(6);
+    var sb   = now cs6.bind(6);
+    array_push(motors, claw);                 // 12 Xinu = 6 モータ + 6 センサ
+    array_push(sensors, cs6);
+    var kin = new Kinematics();
+    var mv  = new ArmMover();
+    var mvw = now mv.wire(motors);
+    var cam = new CameraActor();
+    var rec = new RecognitionActor();
+    var model = tinyml_load(env_get("DOFBOT_MODEL", "aipl/tinyml_model.json"));   // → fs
+    var rw  = now rec.wire(model);
+    var sh  = new ShelfActor();
+    planner = new PlannerActor();
+    var pw  = now planner.wire(kin, mv, claw, cam, rec, sh);
     reply(1);
   }
-  method halt() { reply(0); }               // net
+
+  // n 個ぶん「掴んで色の合った棚へ置く」を繰り返す
+  method run(n) !{ai, fs, net} {
+    var i = 0;
+    while (i < n) do {
+      print("--- サイクル " + (i + 1) + " ---");
+      var c = now planner.run_one();
+      i = i + 1;
+    }
+    print("[dofbot] " + n + " サイクル完了。サーボ指令 " + dofbot_servo_writes() + " 回。");
+    reply(dofbot_servo_writes());
+  }
 }
+
+var coord = new Coordinator();
+send coord.setup();
+print("[dofbot] 12 Xinu(6サーボ x 2) + TinyML 起動。");
+print("[dofbot] Capability: Motor!{mut,net} / Sensor!{net} / Recognition!{ai,net} / Planner!{ai,fs,net}");
+send coord.run(6);
