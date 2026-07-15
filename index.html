@@ -76,9 +76,11 @@
 
       <section>
         <h2>Actor / Capability（効果推論）</h2>
-        <p class="hint">各軸に Xinu を2台（計12）割当。<b>ソースには効果注釈を書かず</b>、メソッド本体から
-        AICE が <span class="cap cap-mut">!{mut}</span><span class="cap cap-ai">!{ai}</span><span class="cap cap-net">!{net}</span><span class="cap cap-fs">!{fs}</span>
-        を<b>推論</b>して役割を導出します。カードをクリックすると該当ソースへジャンプ。数値は実機バスサーボへの指令角。</p>
+        <p class="hint">各軸に Xinu を2台（計12）割当。各メソッド<b>本体の primitive から</b>
+        <span class="cap cap-mut">!{mut}</span><span class="cap cap-ai">!{ai}</span><span class="cap cap-net">!{net}</span><span class="cap cap-fs">!{fs}</span>
+        を<b>推論</b>して役割を導出します（下のチップは推論結果）。AIPL ソース側の申告と一致するかは
+        実処理系が検査します（<code>./aipl/run_aipl.sh check</code>）。<br>
+        丸数字は CG のサーボ・ホーンの番号と一致。カードをクリックすると該当ソースへジャンプ。数値は実機バスサーボへの指令角。</p>
         <div id="actorGrid" class="actor-grid"></div>
       </section>
 

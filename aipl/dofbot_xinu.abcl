@@ -38,8 +38,10 @@ class ServoMotor {
 }
 
 // ── 各軸 Xinu-B：サーボ・センサ（バスサーボの現在角を計測・報告。read-only）──
-//    Arm_serial_servo_read は効果を持たないので、このクラスに mut は付かない。
-//    = センサは物理的に何も動かせないことが型で保証される。
+//    read() は !{net} だけ。Arm_serial_servo_read が効果を持たない＝計測は
+//    何も動かさない、ことが型で保証される。ServoMotor と違い、このアクターは
+//    Arm_serial_servo_write を呼べる場所がどこにも無い＝物理的に駆動できない。
+//    （bind() の mut は自分のフィールド id への代入であって、サーボ駆動ではない）
 class ServoSensor {
   var id = 0;
   method bind(i) !{mut, net} { id = i; reply(1); }
@@ -125,6 +127,43 @@ class ArmMover {
   }
 }
 
+// ── コンベア・アクター（ベルト駆動とストッパ。部品を停止位置で保持する）──────
+//   dofbot_belt_drive がアクチュエータなので mut を持つ。アームとは独立した
+//   駆動権限であり、Planner からは触れない。
+class ConveyorActor {
+  var stopped = 0;
+  method feed() !{mut, net} {
+    stopped = 0;
+    dofbot_belt_drive(1);                     // 次の部品をストッパまで送る → mut
+    reply(1);
+  }
+  method arrived() !{mut, net} {              // ストッパで部品が停止した
+    stopped = 1;
+    reply(1);
+  }
+  method eject() !{mut, net} {                // 不良品はストッパを開けて排出
+    stopped = 0;
+    dofbot_belt_drive(2);                     // → mut
+    reply(1);
+  }
+}
+
+// ── 安全アクター（サイクルの記録。永続化を一手に引き受ける）──────────────────
+//   fs を持つのはここだけ。Planner から write_file を取り上げたことで、
+//   Planner の効果は !{ai, net} まで落ちる（駆動も永続化もできない）。
+class SafetyActor {
+  var done = 0;
+  method complete(shelf, slot) !{fs, mut, net} {
+    done = done + 1;
+    write_file("cycle.log", "shelf " + shelf + " slot " + slot);   // 永続化 → fs
+    reply(done);
+  }
+  method abort(reason) !{fs, net} {
+    write_file("cycle.log", reason);          // → fs
+    reply(0);
+  }
+}
+
 // ── カメラ・アクター（手首カメラ。撮像のみなので効果は net だけ）────────────
 class CameraActor {
   method capture() !{net} {
@@ -148,15 +187,17 @@ class RecognitionActor {
 // ── 棚アクター（色別 3 棚 x 4 スロット。満杯なら出荷して空にする）───────────
 class ShelfActor {
   var used = [0, 0, 0];
-  method alloc(shelf) !{fs, mut, net} {
+  var shipped = 0;
+  method alloc(shelf) !{mut, net} {
     var n = used[shelf];
     if (n >= 4) {                             // 満杯 → 出荷して空ける
-      write_file("shipment.log", "shelf " + shelf + " shipped");   // 永続化 → fs
+      shipped = shipped + 1;                  // → mut
       n = 0;
     }
     array_set(used, shelf, n + 1);            // → mut
     reply(n);
   }
+  method shipments() !{net} { reply(shipped); }
   method count(shelf) !{net} { reply(used[shelf]); }
 }
 
@@ -169,19 +210,26 @@ class PlannerActor {
   var camera = 0;
   var recog  = 0;
   var shelf  = 0;
+  var belt   = 0;
+  var safety = 0;
   // 作業セルの座標（src/layout.js と同一）
   var STX = 0.0 - 0.832;  var STY = 0.90;  var STZ = 0.0 - 1.188;   // コンベア停止位置
   var HOVER = 0.239;
   var CARRY_U = 0.722;     var CARRY_Y = 1.539;
 
-  method wire(k, mv, c, cam, r, sh) !{mut, net} {
-    kin = k; mover = mv; claw = c; camera = cam; recog = r; shelf = sh; reply(1);
+  method wire(k, mv, c, cam, r, sh, bl, sf) !{mut, net} {
+    kin = k; mover = mv; claw = c; camera = cam; recog = r; shelf = sh;
+    belt = bl; safety = sf; reply(1);
   }
 
   // NOTE: このメソッドから `now self.xxx()` は絶対に書かないこと。自分宛の now は
   // 自分が処理中なので永久に返らない（自己デッドロック）。幾何計算はすべて
   // 別アクター Kinematics 側に置き、`now kin.xxx()` で呼ぶ。
-  method run_one() !{ai, fs, net} {
+  //   駆動(mut)も永続化(fs)も持たない = !{ai, net} だけ。サーボは ServoMotor、
+  //   ベルトは ConveyorActor、ログは SafetyActor しか触れない（最小権限）。
+  method run_one() !{ai, net} {
+    var st = now belt.arrived();              // ストッパで部品が止まっている
+
     // ① グリッパを開く
     var r0 = now claw.write(180, 195);
 
@@ -231,7 +279,8 @@ class PlannerActor {
     var qh = now kin.solve(0.0 - 1.0805, 1.75, 0.0 - 0.3933);
     var ra = now mover.to(qh, 1363);
 
-    write_file("cycle.log", "shelf " + cls + " slot " + slot);     // 永続化 → fs
+    send safety.complete(cls, slot);          // 永続化は SafetyActor の仕事 → net
+    var fd = now belt.feed();                 // 次の部品を停止位置へ → net
     reply(cls);
   }
 }
@@ -271,13 +320,15 @@ class Coordinator {
     var model = tinyml_load(env_get("DOFBOT_MODEL", "aipl/tinyml_model.json"));   // → fs
     var rw  = now rec.wire(model);
     var sh  = new ShelfActor();
+    var bl  = new ConveyorActor();
+    var sf  = new SafetyActor();
     planner = new PlannerActor();
-    var pw  = now planner.wire(kin, mv, claw, cam, rec, sh);
+    var pw  = now planner.wire(kin, mv, claw, cam, rec, sh, bl, sf);
     reply(1);
   }
 
   // n 個ぶん「掴んで色の合った棚へ置く」を繰り返す
-  method run(n) !{ai, fs, net} {
+  method run(n) !{ai, net} {
     var i = 0;
     while (i < n) do {
       print("--- サイクル " + (i + 1) + " ---");

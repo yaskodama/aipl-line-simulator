@@ -46,17 +46,34 @@ function showRecognition(r, truth) {
 // ===================== Capability（効果）推論エンジン =====================
 // AIPL ソースに !{...} は書かない。各メソッド本体の一次作用(primitive)を走査して
 // !{mut, ai, net, fs} を導出し、そこから役割を推論する。
-const PRIM = 'Arm_serial_servo_write|Arm_serial_servo_read|belt_drive|send|now|reply|remote|grip_set|'
-  + 'ai_infer|vision_detect|llm_ask|recognize|file_write|file_read|persist|camera_grab|'
-  + 'inverse_kinematics|carry_pose|slot_pose|home_pose|grip_angle|motor_of|arm_mover|'
-  + 'shelf_alloc|shelf_clear|shelf_count|array_push';
+// AIPL 処理系に実在する組込みだけを並べる（BUILTINS.md と対応）。
+// ここに実在しない名前を書くと、強調も効果推論も黙って空振りする。
+const PRIM = 'Arm_serial_servo_write6|Arm_serial_servo_write|Arm_serial_servo_read|'
+  + 'dofbot_belt_drive|dofbot_camera_grab|dofbot_camera_truth|dofbot_servo_writes|'
+  + 'tinyml_load|tinyml_infer|tinyml_argmax|'
+  + 'write_file|read_file|append_file|env_get|print|'
+  + 'send|now|future|await|reply|remote|'
+  + 'array_push|array_set|array_len|sqrt|sin|cos|atan2|acos|floor';
 const KW = 'class|method|var|while|do|if|else|new|return|self';
-const MUT_PRIM = ['Arm_serial_servo_write', 'belt_drive', 'shelf_clear', 'grip_set'];
+// 効果の対応表（aipl_typeck.BUILTIN_EFFECTS と一致させること）
+const MUT_PRIM = ['Arm_serial_servo_write', 'Arm_serial_servo_write6', 'dofbot_belt_drive'];
+const AI_PRIM  = ['tinyml_infer'];
+const FS_PRIM  = ['write_file', 'read_file', 'append_file', 'tinyml_load'];
+const NET_PRIM = ['send', 'now', 'future', 'await', 'reply', 'remote'];
 
+// text[i] の '{' に対応する '}' の位置
+function closeFrom(text, i) {
+  let depth = 0;
+  for (let j = i; j < text.length; j++) {
+    const c = text[j];
+    if (c === '{') depth++;
+    else if (c === '}' && --depth === 0) return j;
+  }
+  return text.length - 1;
+}
 function matchBrace(text, from) {
-  let i = text.indexOf('{', from), depth = 0, j = i;
-  for (; j < text.length; j++) { const c = text[j]; if (c === '{') depth++; else if (c === '}') { depth--; if (depth === 0) break; } }
-  return { open: i, close: j };
+  const i = text.indexOf('{', from);
+  return { open: i, close: closeFrom(text, i) };
 }
 function parseClasses(text) {
   const classes = {}; const re = /class\s+(\w+)\s*\{/g; let m;
@@ -71,11 +88,25 @@ function parseClasses(text) {
   }
   return classes;
 }
+// method 名(引数) [-> 戻り型] [!{効果}] { 本体 }
+// 効果注釈と戻り型注釈は省略可。ここを `\)\s*\{` に固定すると、注釈付きの
+// メソッドを 1 つも拾えず「効果が何も推論されない」状態に黙って落ちる。
+const RE_METHOD = /method\s+(\w+)\s*\([^)]*\)\s*(?:->\s*[^{!]+?)?\s*(?:!\s*\{([^}]*)\})?\s*\{/g;
+
 function getMethods(body) {
-  const out = []; const re = /method\s+(\w+)\s*\([^)]*\)\s*\{/g; let m;
+  const out = []; const re = new RegExp(RE_METHOD.source, 'g'); let m;
   while ((m = re.exec(body))) {
-    const { open, close } = matchBrace(body, m.index);
-    out.push({ name: m[1], full: body.slice(m.index, close + 1), mbody: body.slice(open + 1, close) });
+    // 本体の '{' は正規表現の末尾そのもの。indexOf('{') で探すと効果注釈
+    // !{mut, net} の波括弧を掴んでしまい、mbody が "mut, net" になって
+    // primitive が 1 つも見つからず、効果推論が全クラスで空になる。
+    const open = m.index + m[0].length - 1;
+    const close = closeFrom(body, open);
+    out.push({
+      name: m[1],
+      declared: m[2] ? m[2].split(',').map(s => s.trim()).filter(Boolean) : null,
+      full: body.slice(m.index, close + 1),
+      mbody: body.slice(open + 1, close),
+    });
     re.lastIndex = close + 1;
   }
   return out;
@@ -90,28 +121,36 @@ function inferCaps(cls) {
   const methods = getMethods(cls.body);
   const fields = classFields(cls.body, methods);
   const caps = { mut:false, ai:false, net:false, fs:false }; const why = new Set();
+  const declared = new Set();
+  for (const meth of methods) for (const e of (meth.declared ?? [])) declared.add(e);
   for (const meth of methods) {
     const b = meth.mbody;
-    for (const p of ['send','now','reply','remote']) if (new RegExp('\\b'+p+'\\b').test(b)) { caps.net = true; why.add(p); }
-    for (const p of ['ai_infer','vision_detect','llm_ask','recognize']) if (new RegExp('\\b'+p+'\\b').test(b)) { caps.ai = true; why.add(p); }
-    for (const p of ['file_write','file_read','persist']) if (new RegExp('\\b'+p+'\\b').test(b)) { caps.fs = true; why.add(p); }
+    for (const p of NET_PRIM) if (new RegExp('\\b'+p+'\\b').test(b)) { caps.net = true; why.add(p); }
+    for (const p of AI_PRIM)  if (new RegExp('\\b'+p+'\\b').test(b)) { caps.ai = true; why.add(p); }
+    for (const p of FS_PRIM)  if (new RegExp('\\b'+p+'\\b').test(b)) { caps.fs = true; why.add(p); }
     for (const p of MUT_PRIM) if (new RegExp('\\b'+p+'\\b').test(b)) { caps.mut = true; why.add(p); }
     for (const f of fields) if (new RegExp('\\b'+f+'\\s*=(?!=)').test(b)) { caps.mut = true; why.add(f+'='); }
   }
-  return { caps, why: [...why] };
+  // 本体から推論した効果と、ソースが申告している効果の一致を見る。
+  // 実処理系 (aipl_main.py --type-check) が同じ検査をしており、そこで
+  // 「declared {mut,net} but uses {fs}」のように食い違いを弾く。
+  const inferred = new Set(['mut','ai','net','fs'].filter(k => caps[k]));
+  const missing = [...inferred].filter(e => !declared.has(e));   // 申告漏れ
+  return { caps, why: [...why], declared: [...declared], missing };
 }
 function inferRole(caps, cls) {
   const b = cls.body;
   if (/Arm_serial_servo_write/.test(b)) return 'アクチュエータ（バスサーボ駆動）';
   if (/Arm_serial_servo_read/.test(b)) return 'センサ（サーボ角計測・read-only）';
-  if (/belt_drive/.test(b)) return 'コンベア駆動（ベルト/ストッパ）';
-  if (/vision_detect|camera_grab/.test(b)) return '知覚（カメラ・物体検出）';
-  if (/ai_infer/.test(b)) return '認識（色の AI 分類）';
-  if (/shelf_alloc|shelf_clear/.test(b)) return '棚の在庫管理（スロット割当・出荷）';
-  if (/inverse_kinematics/.test(b)) return '動作計画（IK・駆動権限なし）';
-  if (/motor_of/.test(b)) return '搬送（サーボへ駆動委譲）';
-  if (caps.fs && caps.net) return '安全監視（永続ログ）';
-  if (/array_push/.test(b)) return '調整（12 Xinu 巡回）';
+  if (/dofbot_belt_drive/.test(b)) return 'コンベア駆動（ベルト/ストッパ）';
+  if (/dofbot_camera_grab/.test(b)) return '知覚（手首カメラ撮像）';
+  if (/tinyml_infer/.test(b)) return '認識（TinyML・機外へ出さない）';
+  if (/atan2|acos/.test(b)) return '運動学（IK・純計算）';
+  if (/array_set/.test(b) && /alloc/.test(b)) return '棚の在庫管理（スロット割当・出荷）';
+  if (/write_file/.test(b)) return '安全監視（永続ログ）';
+  if (/new ServoMotor/.test(b)) return '調整（12 Xinu 生成・巡回）';
+  if (/motors\[/.test(b)) return '搬送（サーボへ駆動委譲）';
+  if (/camera|recog|mover/.test(b)) return '動作計画（駆動権限なし）';
   return caps.net ? '通信' : '純計算';
 }
 function capsChips(caps) {
@@ -134,17 +173,17 @@ function highlight(code) {
 // 「そのクラス本体の中でこの字面を含む最初の行」として解決するので、
 // ソースを編集しても対応が壊れない。
 const PCMAP = {
-  'conveyor.arrived': ['ConveyorActor',   'send CameraActor.capture'],
-  'conveyor.release': ['ConveyorActor',   'belt_drive(2)'],
-  'camera.capture':   ['CameraActor',     'vision_detect(img)'],
-  'recog.classify':   ['RecognitionActor','ai_infer(det)'],
-  'shelf.assign':     ['ShelfActor',      'shelf_alloc(shelf)'],
-  'shelf.ship':       ['ShelfActor',      'shelf_clear(shelf)'],
-  'plan.approach':    ['PlannerActor',    'inverse_kinematics(obj, 40)'],
-  'plan.ik':          ['PlannerActor',    'grip_angle(obj)'],
-  'inspect':          ['CameraActor',     'camera_grab()'],
+  'conveyor.arrived': ['ConveyorActor',   'stopped = 1'],
+  'conveyor.feed':    ['ConveyorActor',   'dofbot_belt_drive(1)'],
+  'conveyor.release': ['ConveyorActor',   'dofbot_belt_drive(2)'],
+  'camera.capture':   ['CameraActor',     'dofbot_camera_grab()'],
+  'recog.classify':   ['RecognitionActor','tinyml_infer(model, frame)'],
+  'shelf.assign':     ['ShelfActor',      'array_set(used, shelf, n + 1)'],
+  'shelf.ship':       ['ShelfActor',      'shipped = shipped + 1'],
+  'plan.approach':    ['PlannerActor',    'now kin.solve(STX, STY + HOVER, STZ)'],
+  'plan.ik':          ['PlannerActor',    'now kin.slot_pose(cls, slot)'],
   'open':             ['PlannerActor',    '// ①'],
-  'above':            ['PlannerActor',    '// ②'],
+  'inspect':          ['PlannerActor',    '// ②'],
   'descend':          ['PlannerActor',    '// ③'],
   'grasp':            ['PlannerActor',    '// ④'],
   'lift':             ['PlannerActor',    '// ⑤'],
@@ -154,10 +193,11 @@ const PCMAP = {
   'release':          ['PlannerActor',    '// ⑨'],
   'retreat':          ['PlannerActor',    '// ⑩'],
   'home':             ['PlannerActor',    '// ⑪'],
-  'safety.complete':  ['SafetyActor',     'file_write("cycle.log", shelf)'],
-  'safety.abort':     ['SafetyActor',     'send ConveyorActor.release'],
+  'safety.complete':  ['SafetyActor',     'write_file("cycle.log", "shelf "'],
+  'safety.abort':     ['SafetyActor',     'write_file("cycle.log", reason)'],
   'servo.write':      ['ServoMotor',      'Arm_serial_servo_write(id, angle, ms)'],
-  'mover.to':         ['ArmMover',        'now m.write(q[id], ms)'],
+  'mover.to':         ['ArmMover',        'now m.write(q[j], ms)'],
+  'kin.solve':        ['Kinematics',      'var beta = acos(cosB)'],
 };
 let PC = {};              // key → 行番号(1始まり)
 let LINES = [];           // 行番号(1始まり) → 行の DOM
@@ -206,7 +246,10 @@ function setPC(key, actor) {
 
 // ===================== 画面構築（12 Xinu + アプリ層） =====================
 let CLASSES = {}, INFO = {}, FULLSRC = '';
-const APP_ACTORS = ['ConveyorActor','CameraActor','RecognitionActor','ShelfActor','PlannerActor','ArmMover','SafetyActor','Coordinator'];
+// AIPL のクラスと一対一。ここに AIPL に無い名前を書くと INFO[name] が undefined で
+// カード生成が例外になり、ソース表示ごと落ちる（実際に落とした）ので buildCards 側で防ぐ。
+const APP_ACTORS = ['ConveyorActor','CameraActor','RecognitionActor','Kinematics',
+                    'ShelfActor','PlannerActor','ArmMover','SafetyActor','Coordinator'];
 const SERVOS = [   // 実機 DOFBOT のサーボ割当（6軸 = 6 サーボ, ID6 がグリッパ）
   { id: 1, name: 'ベース旋回' }, { id: 2, name: '肩' }, { id: 3, name: '肘' },
   { id: 4, name: '手首ピッチ' }, { id: 5, name: '手首回転' }, { id: 6, name: 'グリッパ' },
@@ -229,9 +272,15 @@ function showAll() {
 
 function card(actorId, clsName, title, servoId) {
   const info = INFO[clsName];
+  if (!info) {   // AIPL に無いクラスを参照した = 対応表がずれている。黙って落とさず報告する
+    log('AICE', `カード生成: AIPL に class ${clsName} が無い（対応表がずれている）`);
+    return null;
+  }
   const div = document.createElement('div'); div.className = 'actor';
   div.dataset.actor = actorId; div.dataset.cls = clsName;
-  div.innerHTML = `<strong>${title}</strong><span class="role">${info.role}</span>`
+  // servoId があれば、CG のホーン(銀色丸)に焼いてある番号と同じ丸バッジを出す
+  div.innerHTML = (servoId ? `<b class="horn">${servoId}</b>` : '')
+    + `<strong>${title}</strong><span class="role">${info.role}</span>`
     + (servoId ? `<span class="sv" data-sv="${servoId}">—</span>` : '')
     + `<div class="caps">${capsChips(info.caps)}</div>`;
   div.addEventListener('click', () => focusClass(clsName));
@@ -242,13 +291,15 @@ function groupHead(text) {
 }
 function buildCards() {
   ui.actorGrid.innerHTML = '';
-  ui.actorGrid.append(groupHead('物理層 — 12 Xinu（6 サーボ × 2）'));
+  ui.actorGrid.append(groupHead('物理層 — 12 Xinu（6 サーボ × 2）／番号は CG の銀色ホーンと一致'));
   for (const sv of SERVOS) {
-    ui.actorGrid.append(card(`ID${sv.id}-A`, 'ServoMotor', `ID${sv.id}-A · ${sv.name}`, sv.id));
-    ui.actorGrid.append(card(`ID${sv.id}-B`, 'ServoSensor', `ID${sv.id}-B · ${sv.name}`, sv.id));
+    for (const [sfx, cls] of [['A', 'ServoMotor'], ['B', 'ServoSensor']]) {
+      const el = card(`ID${sv.id}-${sfx}`, cls, `ID${sv.id}-${sfx} · ${sv.name}`, sv.id);
+      if (el) ui.actorGrid.append(el);
+    }
   }
   ui.actorGrid.append(groupHead('アプリ層アクター — Raspberry Pi 5'));
-  for (const name of APP_ACTORS) ui.actorGrid.append(card(name, name, name));
+  for (const name of APP_ACTORS) { const el = card(name, name, name); if (el) ui.actorGrid.append(el); }
 }
 
 // 棚の在庫表示
@@ -446,7 +497,9 @@ ui.speed.addEventListener('input', () => { simulator.speed = Number(ui.speed.val
 fetch('./aipl/dofbot_xinu.abcl').then(r => r.text()).then(text => {
   FULLSRC = text; CLASSES = parseClasses(text);
   for (const [name, cls] of Object.entries(CLASSES)) {
-    const { caps } = inferCaps(cls); INFO[name] = { caps, role: inferRole(caps, cls) };
+    const { caps, missing } = inferCaps(cls);
+    INFO[name] = { caps, missing, role: inferRole(caps, cls) };
+    if (missing.length) log('AICE', `${name}: 申告漏れ ${missing.map(e => '!{'+e+'}').join('')}`);
   }
   buildCards(); renderSource(text); PC = resolvePC(text, CLASSES);
   log('AICE', `効果推論完了: ${Object.keys(CLASSES).length} クラス → Capability を導出`);

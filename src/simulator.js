@@ -13,6 +13,7 @@ const COL = {
   horn: 0xc3cad6, finger: 0x111318, camera: 0x0c0e12, lens: 0x2dd4bf,
 };
 const sc = x => x * x * x * (10 - 15 * x + 6 * x * x);   // min-jerk 補間
+const _dummy = new THREE.Object3D();   // 番号板の向き計算用（毎フレーム使い回す）
 
 // 部品の種類（色 → 形状・寸法・掴み代）
 export const KINDS = {
@@ -30,6 +31,29 @@ export const WRIST = {
   fov: 55, res: 96,
   noise: { gain: [0.55, 1.45], wb: [0.85, 1.15], sigma: 12 },
 };
+
+// ── サーボ番号板（銀色ホーンに焼き込む数字）────────────────────────────────
+// 実機のバスサーボ ID (1..6) を CG 上で読めるようにする。番号は
+// アクターカードの ID / Arm_serial_servo_write(id, ...) の id と一対一。
+const _hornTex = {};
+function hornTexture(n) {
+  if (_hornTex[n]) return _hornTex[n];
+  const c = document.createElement('canvas'); c.width = c.height = 128;
+  const x = c.getContext('2d');
+  x.fillStyle = '#c3cad6'; x.beginPath(); x.arc(64, 64, 63, 0, Math.PI * 2); x.fill();
+  x.strokeStyle = '#7c8697'; x.lineWidth = 4; x.beginPath(); x.arc(64, 64, 58, 0, Math.PI * 2); x.stroke();
+  for (let i = 0; i < 6; i++) {            // ホーンのネジ穴
+    const a = i * Math.PI / 3;
+    x.fillStyle = '#8b93a1'; x.beginPath();
+    x.arc(64 + 46 * Math.cos(a), 64 + 46 * Math.sin(a), 5, 0, Math.PI * 2); x.fill();
+  }
+  x.fillStyle = '#0b0d11'; x.font = 'bold 74px system-ui, sans-serif';
+  x.textAlign = 'center'; x.textBaseline = 'middle';
+  x.fillText(String(n), 64, 68);
+  const t = new THREE.CanvasTexture(c);
+  t.anisotropy = 8; t.colorSpace = THREE.SRGBColorSpace;
+  _hornTex[n] = t; return t;
+}
 
 const FINGER_T = 0.07;                  // 指の厚み
 const GRIP_X = { closed: 0.09, open: 0.30 };
@@ -56,6 +80,7 @@ export class LineSimulator {
     this.activeServo = -1;
     this.stationPart = null;          // ストッパで停止中の部品
     this.racks = [];                  // { key,color,group,slots:[{pos,part}] }
+    this.servoGroups = {};            // サーボ ID -> CG のサーボ Group（番号板の点灯用）
     // カメラ劣化モデル用の擬似乱数（seed 固定 = 学習データと実行が再現可能）
     let _s = 20260715;
     this.rand = () => { _s = (_s * 1103515245 + 12345) & 0x7fffffff; return _s / 0x7fffffff; };
@@ -93,6 +118,7 @@ export class LineSimulator {
 
     this.buildConveyor(); this.buildRacks(); this.buildArm();
     this.applyJoints(this.HOME); this.setGrip(1);
+    this.updateServoLabels(-1);      // 停止中でも数字は鉛直に立てておく
 
     // 手首カメラの描画先。ここから読んだピクセルが TinyML の入力になる。
     this.wristRT = new THREE.WebGLRenderTarget(WRIST.res, WRIST.res);
@@ -198,18 +224,33 @@ export class LineSimulator {
     }
   }
 
-  makeServo(size = 0.5) {
+  // サーボ本体。id を渡すと両側のホーン（銀色丸）にサーボ番号を焼き込む。
+  // CG のこの番号 = アクターカードの ID番号 = Arm_serial_servo_write(id, ...) の id。
+  makeServo(size = 0.5, id = 0) {
     const g = new THREE.Group();
     const body = new THREE.Mesh(new THREE.BoxGeometry(size, size * 1.05, size * 0.62),
       new THREE.MeshStandardMaterial({ color: COL.servo, metalness: 0.35, roughness: 0.45 }));
     body.castShadow = true; g.add(body);
     const cap = new THREE.Mesh(new THREE.BoxGeometry(size * 1.02, size * 0.16, size * 0.64),
       new THREE.MeshStandardMaterial({ color: COL.servoDark })); cap.position.y = size * 0.55; g.add(cap);
+    const labels = [];
     for (const s of [-1, 1]) {
       const horn = new THREE.Mesh(new THREE.CylinderGeometry(size * 0.26, size * 0.26, size * 0.08, 20),
         new THREE.MeshStandardMaterial({ color: COL.horn, metalness: 0.8, roughness: 0.3 }));
       horn.rotation.x = Math.PI / 2; horn.position.z = s * size * 0.34; g.add(horn);
+      if (!id) continue;
+      // 番号板をホーンの外側の面に貼る。両面に貼るので、旋回してどちらを向いても読める。
+      const label = new THREE.Mesh(new THREE.CircleGeometry(size * 0.26, 24),
+        new THREE.MeshBasicMaterial({ map: hornTexture(id), transparent: true }));
+      label.position.z = s * size * 0.385;              // ホーン外面(0.34+0.04)のすぐ外
+      // 板は関節と一緒に回るので、そのままだと数字が傾いて読めなくなる（肘は最大116°回る）。
+      // 面の向き(外向き)は保ったまま、毎フレーム「文字だけ」を鉛直に立て直す。
+      label.userData.outward = new THREE.Vector3(0, 0, s);
+      g.add(label); labels.push(label);
     }
+    g.userData.servoId = id;
+    g.userData.labels = labels;
+    if (id) this.servoGroups[id] = g;
     return g;
   }
   makeBracket(len, w = 0.3) {
@@ -244,26 +285,26 @@ export class LineSimulator {
 
     // ID1 ベース旋回
     const j1 = new THREE.Group(); j1.position.y = GEO.j1Y; this.armRoot.add(j1);
-    const sv1 = this.makeServo(0.5); sv1.position.y = 0.22; j1.add(sv1);
+    const sv1 = this.makeServo(0.5, 1); sv1.position.y = 0.22; j1.add(sv1);
     const b1 = this.makeBracket(GEO.shoulderY - 0.45); b1.position.y = 0.45; j1.add(b1);
 
     // ID2 肩
     const j2 = new THREE.Group(); j2.position.y = GEO.shoulderY; j1.add(j2);
-    j2.add(this.makeServo(0.44));
+    j2.add(this.makeServo(0.44, 2));
     const b2 = this.makeBracket(GEO.L1 - 0.14); b2.position.y = 0.14; j2.add(b2);
 
     // ID3 肘
     const j3 = new THREE.Group(); j3.position.y = GEO.L1; j2.add(j3);
-    j3.add(this.makeServo(0.4));
+    j3.add(this.makeServo(0.4, 3));
     const b3 = this.makeBracket(GEO.L2 - 0.13); b3.position.y = 0.13; j3.add(b3);
 
     // ID4 手首ピッチ
     const j4 = new THREE.Group(); j4.position.y = GEO.L2; j3.add(j4);
-    j4.add(this.makeServo(0.34));
+    j4.add(this.makeServo(0.34, 4));
 
     // ID5 手首回転（回転軸が手先方向と一直線 = 把持点を動かさない）
     const j5 = new THREE.Group(); j5.position.y = 0.3; j4.add(j5);
-    j5.add(this.makeServo(0.3));
+    j5.add(this.makeServo(0.3, 5));
 
     const hand = new THREE.Group(); hand.position.y = 0.22; j5.add(hand);
 
@@ -297,11 +338,10 @@ export class LineSimulator {
     this.wristCam.rotation.x = Math.atan2(d.y, -d.z);
     hand.add(this.wristCam);
 
-    // ID6 グリッパ
+    // ID6 グリッパ。実機同様、グリッパ・サーボが手のひらを兼ねる
+    // （従来はただの箱で、番号を振るホーンが存在しなかった）。
     this.gripper = new THREE.Group(); hand.add(this.gripper);
-    const palm = new THREE.Mesh(new THREE.BoxGeometry(0.4, 0.12, 0.28),
-      new THREE.MeshStandardMaterial({ color: COL.bracket, metalness: 0.5 }));
-    palm.position.y = 0.06; this.gripper.add(palm);
+    const palm = this.makeServo(0.3, 6); palm.position.y = 0.07; this.gripper.add(palm);
     // 把持点。j4 からの距離が GEO.L3 と厳密に一致する（= IK が解く手先そのもの。tipY は上で算出済み）
     this.gripTip = new THREE.Group();
     this.gripTip.position.y = tipY;
@@ -503,6 +543,7 @@ export class LineSimulator {
     for (let i = 0; i < 5; i++) { const v = Math.abs(this.q[i] - this.qPrev[i]); if (v > mv) { mv = v; mj = i; } }
     if (Math.abs(this.grip - this.gripPrev) * 0.7 > mv) mj = 5;
     this.activeServo = mj;
+    this.updateServoLabels(mj);
     this.onServo?.(servoAngles(this.q, this.grip));
     // 実機で成立しない指令が出ていないかを常時監視（clamp で誤魔化さない）
     const bad = servoOutOfRange(this.q, this.grip);
@@ -521,6 +562,30 @@ export class LineSimulator {
   resize() {
     const w = this.container.clientWidth, h = this.container.clientHeight;
     this.camera.aspect = w / h; this.camera.updateProjectionMatrix(); this.renderer.setSize(w, h);
+  }
+
+  // ── サーボ番号板の姿勢と点灯 ────────────────────────────────────────────
+  //   ・数字が関節と一緒に傾かないよう、面の外向きは保ったまま鉛直に立て直す
+  //   ・駆動中のサーボの番号を点灯（アクターカードの点灯と同じ ID が光る）
+  updateServoLabels(active) {
+    const up = new THREE.Vector3(0, 1, 0);
+    const pq = new THREE.Quaternion(), n = new THREE.Vector3(), wp = new THREE.Vector3();
+    for (let id = 1; id <= 6; id++) {
+      const g = this.servoGroups[id]; if (!g) continue;
+      const on = active >= 0 && id === active + 1;
+      for (const lab of g.userData.labels) {
+        lab.material.color.setHex(on ? 0x7dd3fc : 0xffffff);
+        lab.parent.updateWorldMatrix(true, false);
+        lab.parent.getWorldQuaternion(pq);
+        n.copy(lab.userData.outward).applyQuaternion(pq);          // 面の外向き(ワールド)
+        if (Math.abs(n.dot(up)) > 0.999) continue;                 // 真上/真下向きは立て直せない
+        lab.getWorldPosition(wp);
+        _dummy.position.copy(wp);
+        _dummy.up.copy(up);
+        _dummy.lookAt(wp.clone().add(n));                          // Object3D は +Z を target へ向ける
+        lab.quaternion.copy(pq.invert().multiply(_dummy.quaternion));
+      }
+    }
   }
 
   // ── 手首カメラの 1 フレーム ─────────────────────────────────────────────

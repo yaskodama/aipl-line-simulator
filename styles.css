@@ -53,7 +53,14 @@ button:hover { border-color:var(--accent); }
 .actor { border:1px solid var(--line); border-radius:10px; padding:9px; background:var(--card); cursor:pointer; transition:border-color .12s, box-shadow .12s; }
 .actor:hover { border-color:var(--accent); }
 .actor.active { border-color:var(--accent); box-shadow:0 0 0 1px var(--accent) inset; }
-.actor strong { display:block; margin-bottom:3px; font-size:.82rem; }
+.actor { position:relative; }
+.actor .horn { position:absolute; top:7px; right:7px; width:20px; height:20px; border-radius:50%;
+  background:radial-gradient(circle at 35% 30%, #e8edf4, #c3cad6 60%, #98a2b3);
+  border:1px solid #7c8697; color:#0b0d11; font-size:.66rem; font-weight:800;
+  display:flex; align-items:center; justify-content:center; line-height:1; }
+.actor.active .horn { background:radial-gradient(circle at 35% 30%, #bae6fd, #7dd3fc 60%, #38bdf8);
+  border-color:var(--accent); }
+.actor strong { display:block; margin-bottom:3px; font-size:.82rem; padding-right:24px; }
 .actor .role { display:block; color:var(--muted); font-size:.72rem; margin-bottom:4px; }
 .actor .caps { display:flex; flex-wrap:wrap; gap:3px; }
 .cap { font-family:ui-monospace,Menlo,monospace; font-size:.68rem; padding:1px 4px; border-radius:5px; border:1px solid transparent; }
