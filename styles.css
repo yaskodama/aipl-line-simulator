@@ -20,7 +20,7 @@ button:hover { border-color:var(--accent); }
 .side-panel { display:flex; flex-direction:column; gap:16px; }
 .side-panel section { padding:14px; }
 .side-panel h2 { margin:0 0 10px; font-size:1rem; }
-.metrics { display:grid !important; grid-template-columns:repeat(4,1fr); gap:8px; }
+.metrics { display:grid !important; grid-template-columns:repeat(5,1fr); gap:8px; }
 .metrics article { background:var(--card); border-radius:12px; padding:10px; text-align:center; }
 .metrics span { display:block; color:var(--muted); font-size:.78rem; }
 .metrics strong { font-size:1.3rem; }
@@ -39,16 +39,39 @@ button:hover { border-color:var(--accent); }
 .cap-ai  { color:#d8b4fe; background:#581c8733; border-color:#581c87; }
 .cap-net { color:#93c5fd; background:#1e3a8a33; border-color:#1e3a8a; }
 .cap-fs  { color:#fcd34d; background:#78350f33; border-color:#78350f; }
-.src-toolbar { display:flex; justify-content:space-between; align-items:center; gap:8px; margin-bottom:10px; }
-.src-toolbar h2 { margin:0; }
+.src-toolbar { display:flex; justify-content:space-between; align-items:center; gap:8px; margin-bottom:8px; }
+.src-toolbar h2 { margin:0; margin-right:auto; }
 .src-target { color:var(--accent); font-size:.82rem; font-family:ui-monospace,Menlo,monospace; }
 .src-toolbar button { padding:5px 10px; font-size:.78rem; }
-.log,.source-view { background:#020617; border:1px solid var(--line); border-radius:10px; padding:10px; overflow:auto; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:.8rem; }
-.log { height:180px; }
+.src-toolbar .follow { color:var(--muted); font-size:.72rem; display:flex; align-items:center; gap:5px; }
+.log,.source-view { background:#020617; border:1px solid var(--line); border-radius:10px; overflow:auto; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:.8rem; }
+.log { height:170px; padding:10px; }
 .log div { margin-bottom:4px; }
-.source-view { max-height:340px; white-space:pre; line-height:1.5; }
+
+/* 実行中の AIPL 行 */
+.pc-bar { display:flex; align-items:center; gap:8px; margin-bottom:6px; font-size:.74rem; }
+.pc-actor { font-family:ui-monospace,Menlo,monospace; color:#fbbf24; font-weight:600; }
+.pc-line { color:var(--muted); }
+.source-view { max-height:360px; line-height:1.55; padding:8px 0; scroll-behavior:smooth; }
+.source-view .row { display:flex; white-space:pre; }
+.source-view .gut { flex:0 0 3em; text-align:right; padding-right:.8em; color:#3f4c5f; user-select:none; }
+.source-view .ln { flex:1; padding-right:10px; }
+.source-view .row.focus { background:#0e1a2b; }
+.source-view .row.pc { background:#1d4ed855; box-shadow:inset 3px 0 0 var(--accent); }
+.source-view .row.pc .gut { color:var(--accent); font-weight:700; }
 .tok-cm{color:#64748b;font-style:italic}.tok-kw{color:#7dd3fc}.tok-str{color:#86efac}
 .tok-cls{color:#fbbf24;font-weight:600}.tok-prim{color:#f0abfc}
+
+/* 棚の在庫 */
+.shelf-panel { display:flex; flex-direction:column; gap:6px; }
+.rack { display:flex; align-items:center; gap:10px; background:var(--card); border:1px solid var(--line); border-radius:10px; padding:7px 10px; }
+.rack-name { font-size:.78rem; font-weight:600; flex:0 0 5.5em; }
+.slots { display:flex; gap:4px; flex:1; }
+.slots i { width:14px; height:14px; border-radius:3px; border:1px solid; transition:background .2s; }
+.rack-n { font-family:ui-monospace,Menlo,monospace; font-size:.74rem; color:var(--muted); }
+.metrics article em { display:block; font-style:normal; font-size:.62rem; color:var(--muted); margin-top:-2px; }
+.badge.on { color:var(--ok); border-color:var(--ok); }
+.actor .sv { display:block; font-family:ui-monospace,Menlo,monospace; font-size:.72rem; color:var(--accent); margin-bottom:4px; }
 @media (max-width: 1000px) {
   .layout { grid-template-columns:1fr; }
   .scene { height:520px; }

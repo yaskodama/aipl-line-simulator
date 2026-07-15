@@ -3,14 +3,14 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>AIPL 3D Line Work Simulator</title>
+  <title>AIPL 3D Line Work Simulator — DOFBOT 色分け棚入れ</title>
   <link rel="stylesheet" href="./styles.css" />
 </head>
 <body>
   <header class="app-header">
     <div>
       <h1>AIPL 3Dライン作業シミュレータ — Yahboom DOFBOT (6DOF)</h1>
-      <p>実機サーボ ID1..ID6（ベース旋回/肩/肘/手首ピッチ/手首回転/グリッパ）を各軸2 Xinuで制御・Capability推論を可視化</p>
+      <p>コンベアの部品を<b>逆運動学で正確に把持</b>し、<b>色の一致する棚</b>へ置く動作を繰り返します。実行中の AIPL ソース行をリアルタイムに表示。</p>
     </div>
     <span id="statusBadge" class="badge">停止中</span>
   </header>
@@ -35,28 +35,40 @@
         <article><span>処理済み</span><strong id="processed">0</strong></article>
         <article><span>成功</span><strong id="success">0</strong></article>
         <article><span>失敗</span><strong id="failed">0</strong></article>
+        <article><span>把持誤差</span><strong id="graspErr">0.0</strong><em>mm</em></article>
         <article><span>Message</span><strong id="messages">0</strong></article>
+      </section>
+
+      <section>
+        <h2>棚の在庫（色一致で仕分け）</h2>
+        <p class="hint">部品の色を <span class="cap cap-ai">!{ai}</span> で分類し、同じ色の棚の空きスロットへ置きます。満杯になると出荷して空にし、作業を継続します。</p>
+        <div id="shelfPanel" class="shelf-panel"></div>
+      </section>
+
+      <section>
+        <div class="src-toolbar">
+          <h2>実行中の AIPL <span id="srcTarget" class="src-target">全体</span></h2>
+          <label class="check follow"><input id="follow" type="checkbox" checked /> 行を追従</label>
+          <button id="srcAll" type="button">全体</button>
+        </div>
+        <div class="pc-bar">
+          <span class="pc-actor" id="pcActor">—</span>
+          <span class="pc-line" id="pcLine">待機中</span>
+        </div>
+        <div id="sourceView" class="source-view">読み込み中...</div>
       </section>
 
       <section>
         <h2>Actor / Capability（効果推論）</h2>
         <p class="hint">各軸に Xinu を2台（計12）割当。<b>ソースには効果注釈を書かず</b>、メソッド本体から
         AICE が <span class="cap cap-mut">!{mut}</span><span class="cap cap-ai">!{ai}</span><span class="cap cap-net">!{net}</span><span class="cap cap-fs">!{fs}</span>
-        を<b>推論</b>して役割を導出します。カードをクリックするとソースを表示。</p>
+        を<b>推論</b>して役割を導出します。カードをクリックすると該当ソースへジャンプ。数値は実機バスサーボへの指令角。</p>
         <div id="actorGrid" class="actor-grid"></div>
       </section>
 
       <section>
         <h2>AIPLメッセージログ</h2>
         <div id="log" class="log" aria-live="polite"></div>
-      </section>
-
-      <section>
-        <div class="src-toolbar">
-          <h2>AIPLソース <span id="srcTarget" class="src-target">全体</span></h2>
-          <button id="srcAll" type="button">全体を表示</button>
-        </div>
-        <pre id="sourceView" class="source-view">読み込み中...</pre>
       </section>
     </aside>
   </main>

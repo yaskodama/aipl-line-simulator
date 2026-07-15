@@ -8,9 +8,12 @@
 //     ID1 ベース旋回(yaw) / ID2 肩 / ID3 肘 / ID4 手首ピッチ / ID5 手首回転 / ID6 グリッパ
 //   各サーボ(=各軸)に soft-Xinu を 2 台 = 計 12 Xinu。
 //
+//   作業内容: コンベアで流れてきた部品を掴み、色の一致する棚のスロットへ置く。
+//             棚が満杯になったら出荷して空にし、これを延々と繰り返す。
+//
 //   Capability は「ソースに書かない」。各メソッド本体の一次作用(primitive)を
 //   AICE の効果推論が走査し、!{mut, net, ai, fs} を自動導出して役割を推論する:
-//     Arm_serial_servo_write / grip_set / フィールド代入 → mut（アクチュエーション）
+//     Arm_serial_servo_write / belt_drive / フィールド代入 → mut（アクチュエーション）
 //     send / now / reply / remote                        → net（メッシュ通信）
 //     ai_infer / vision_detect / llm_ask                 → ai （AI 推論）
 //     file_write / persist                               → fs （永続化）
@@ -37,22 +40,61 @@ class ServoSensor {
   }
 }
 
-// ── カメラ・アクター（手首 HD カメラ + 3D 深度。AI 物体検出）──
-class CameraActor {
-  method capture() {
-    var img = camera_grab();                // フレーム取得
-    var obj = vision_detect(img);           // 物体検出 → ai
-    send RecognitionActor.classify(obj);    // send → net
+// ── コンベア・アクター（ベルト駆動とストッパ。部品を停止位置で保持する）──
+class ConveyorActor {
+  var stopped = 0;
+  method feed() {
+    belt_drive(1);                          // ベルト前進 → mut
+    reply(1);
+  }
+  method arrived(obj) {                     // ストッパで部品が停止した
+    stopped = 1;                            // → mut
+    send CameraActor.capture(obj);          // 知覚サイクル起動 → net
+  }
+  method release(obj) {                     // 不良品はストッパを開けて排出
+    stopped = 0;                            // → mut
+    belt_drive(2);                          // → mut
+    reply(1);
   }
 }
 
-// ── 認識アクター（色/形の AI 分類。DOFBOT の色認識・把持対象判定）──
+// ── カメラ・アクター（手首 HD カメラ + 3D 深度。AI 物体検出）──
+class CameraActor {
+  method capture(obj) {
+    var img = camera_grab();                // フレーム取得
+    var det = vision_detect(img);           // 物体検出 → ai
+    send RecognitionActor.classify(obj, det);   // send → net
+  }
+}
+
+// ── 認識アクター（色の AI 分類 → 置くべき棚を決める）──
 class RecognitionActor {
-  method classify(obj) {
-    var label = ai_infer(obj);              // 分類推論 → ai
-    var bin = "A";
-    if (label == "blue") { bin = "B"; }
-    send PlannerActor.plan(obj, bin);       // send → net
+  method classify(obj, det) {
+    var color = ai_infer(det);              // 色分類推論 → ai
+    var shelf = "A";                        // 赤 → 棚A
+    if (color == "blue")  { shelf = "B"; }  // 青 → 棚B
+    if (color == "green") { shelf = "C"; }  // 緑 → 棚C
+    send ShelfActor.assign(obj, color, shelf);  // send → net
+  }
+}
+
+// ── 棚アクター（色別 3 棚 × 4 スロットの在庫管理。満杯なら出荷して空にする）──
+class ShelfActor {
+  var used = [];
+  method assign(obj, color, shelf) {
+    var n = shelf_count(shelf);             // その棚の使用スロット数
+    if (n >= 4) {                           // 満杯 → 先に出荷して空ける
+      now self.ship(shelf);
+      n = 0;
+    }
+    var slot = shelf_alloc(shelf);          // 空きスロットを手前段から確保
+    array_push(used, slot);                 // → mut
+    send PlannerActor.plan(obj, shelf, slot);   // send → net
+  }
+  method ship(shelf) {
+    file_write("shipment.log", shelf);      // 出荷を永続化 → fs
+    shelf_clear(shelf);                     // 棚を空にする → mut
+    reply(1);
   }
 }
 
@@ -60,7 +102,7 @@ class RecognitionActor {
 class ArmMover {
   method to(q, ms) {
     var id = 1;
-    while (id < 6) do {                      // ID1..ID5
+    while (id < 6) do {                     // ID1..ID5
       var m = motor_of(id);
       now m.write(q[id], ms);               // now でサーボ・モータへ依頼 → net（mut は持たない）
       id = id + 1;
@@ -70,38 +112,43 @@ class ArmMover {
 }
 
 // ── 計画アクター（逆運動学 + Pick&Place シーケンス）──
-//    「掴む→回転→離す」を実機の順序どおりに発行する。サーボは直接動かせない＝mut を持たない。
+//    「掴む→旋回→棚へ置く」を実機の順序どおりに発行する。サーボは直接動かせない＝mut を持たない。
 class PlannerActor {
-  method plan(obj, bin) {
-    var above = inverse_kinematics(obj, 0); // 物体の真上（ホバー）
-    var grasp = inverse_kinematics(obj, 1); // 物体位置（下降先）
-    var over  = bin_pose(bin, 1);           // bin 上（ホバー）
-    var down  = bin_pose(bin, 0);           // bin へ下降
-    var mover = arm_mover();                // 搬送アクター
-    var claw  = motor_of(6);                // ID6 グリッパ
+  method plan(obj, shelf, slot) {
+    var above = inverse_kinematics(obj, 40);    // 部品の真上（ホバー40mm）
+    var grasp = inverse_kinematics(obj, 0);     // 部品の把持点
+    var carry = carry_pose(obj);                // 引き込んだ搬送姿勢
+    var turn  = carry_pose(slot);               // 棚方向へ旋回した搬送姿勢
+    var over  = slot_pose(slot, 40);            // スロット真上
+    var down  = slot_pose(slot, 0);             // スロットへ下降
+    var mover = arm_mover();                    // 搬送アクター
+    var claw  = motor_of(6);                    // ID6 グリッパ
+    var hold  = grip_angle(obj);                // 部品幅から掴み代を決める
 
-    now claw.write(90, 400);                // ① グリッパを開く
-    now mover.to(above, 800);               // ② 物体の上へ接近
-    now mover.to(grasp, 700);               // ③ 物体まで下降
-    now claw.write(20, 600);                // ④ 把持（グリッパを閉じる）
-    now mover.to(above, 600);               // ⑤ 持ち上げ
-    now mover.to(over, 900);                // ⑥ ベース旋回で搬送（回転）
-    now mover.to(down, 600);                // ⑦ bin 上で下降
-    now claw.write(90, 600);                // ⑧ 解放（グリッパを開く）
-    now mover.to(above, 500);               // ⑨ 退避
-    send SafetyActor.complete(obj);         // 完了通知 → net
+    now claw.write(180, 300);               // ① グリッパを開く
+    now mover.to(above, 700);               // ② 部品の真上へ接近
+    now mover.to(grasp, 500);               // ③ 把持点まで下降
+    now claw.write(hold, 450);              // ④ 把持：指が部品に接するまで閉じる
+    now mover.to(carry, 600);               // ⑤ 持ち上げて引き込む
+    now mover.to(turn, 1000);               // ⑥ 棚の方向へベース旋回
+    now mover.to(over, 700);                // ⑦ スロット真上へ
+    now mover.to(down, 500);                // ⑧ スロットへ下降
+    now claw.write(180, 400);               // ⑨ 解放：棚へ置く
+    now mover.to(over, 450);                // ⑩ 退避
+    now mover.to(home_pose(), 700);         // ⑪ ホームへ戻る
+    send SafetyActor.complete(obj, shelf);  // 完了通知 → net
   }
 }
 
 // ── 安全アクター（作業空間・非常停止の監視。イベントを永続ログへ）──
 class SafetyActor {
-  method complete(obj) {
-    file_write("cycle.log", "ok");          // 永続化 → fs
-    reply(1);                               // reply → net
+  method complete(obj, shelf) {
+    file_write("cycle.log", shelf);         // 永続化 → fs
+    send Coordinator.next();                // 次の部品へ → net
   }
-  method abort(reason) {
+  method abort(obj, reason) {
     file_write("cycle.log", reason);        // fs
-    send Coordinator.halt();                // net
+    send ConveyorActor.release(obj);        // 不良品を排出 → net
   }
 }
 
@@ -111,17 +158,17 @@ class Coordinator {
   var sensors = [];
   method setup() {
     var id = 1;
-    while (id < 7) do {                      // ID1..ID6
+    while (id < 7) do {                     // ID1..ID6
       var m = new ServoMotor();
       var s = new ServoSensor();
-      array_push(motors, m);
+      array_push(motors, m);                // → mut
       array_push(sensors, s);
       id = id + 1;
     }
     reply(1);                               // net
   }
-  method tick() {
-    send CameraActor.capture();             // 1 サイクル起動 → net
+  method next() {
+    send ConveyorActor.feed();              // 次の部品を送る → net
     reply(1);
   }
   method halt() { reply(0); }               // net
