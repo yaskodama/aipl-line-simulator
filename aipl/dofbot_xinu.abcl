@@ -17,7 +17,11 @@
 //   Capability は「ソースに書かない」。各メソッド本体の一次作用(primitive)を
 //   AICE の効果推論が走査して !{mut, net, ai, fs} を導出する。処理系に
 //   --type-check を渡すと、申告と実体の食い違いを検出する:
-//     Arm_serial_servo_write -> mut （唯一の駆動権限）
+//     Arm_serial_servo_write -> act （唯一の駆動権限。mut と分けてある:
+//                                     mut=自分の状態を書く / act=外部世界へ作用する。
+//                                     act は「その機器に繋がったノードで、同時に厳密に
+//                                     1 つだけ」— 二重駆動は物理的に危険なので、
+//                                     フェイルオーバは act の排他移譲として定義できる）
 //     Arm_serial_servo_read  -> 効果なし（計測のみ = read-only）
 //     tinyml_infer           -> ai  （ローカル推論。net を持たない＝機外へ出ない）
 //     tinyml_load / write_file -> fs
@@ -29,7 +33,7 @@ class ServoMotor {
   var id  = 0;
   var pos = 90.0;
   method bind(i) !{mut, net} { id = i; reply(1); }
-  method write(angle, ms) !{mut, net} {
+  method write(angle, ms) !{act, mut, net} {
     pos = angle;                              // フィールド代入 → mut
     Arm_serial_servo_write(id, angle, ms);    // 実機バスサーボ駆動 → mut
     reply(1);
@@ -132,7 +136,7 @@ class ArmMover {
 //   駆動権限であり、Planner からは触れない。
 class ConveyorActor {
   var stopped = 0;
-  method feed() !{mut, net} {
+  method feed() !{act, mut, net} {
     stopped = 0;
     dofbot_belt_drive(1);                     // 次の部品をストッパまで送る → mut
     reply(1);
@@ -141,7 +145,7 @@ class ConveyorActor {
     stopped = 1;
     reply(1);
   }
-  method eject() !{mut, net} {                // 不良品はストッパを開けて排出
+  method eject() !{act, mut, net} {                // 不良品はストッパを開けて排出
     stopped = 0;
     dofbot_belt_drive(2);                     // → mut
     reply(1);
