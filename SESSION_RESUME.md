@@ -1,6 +1,44 @@
 # 次回セッションの再開メモ
 
-最終更新: 2026-07-15 / 全コミット済み・push 済み
+最終更新: 2026-07-23 / **スタンドアロン版は未コミット**（下記「2026-07-23」節を先に読む）
+
+## 2026-07-23 セッション — サーバー不要版と Web 公開
+
+**やったこと**: :8022 と同じシミュレーションを **Web サーバー無し**（`file://` のダブルクリック、
+外部通信ゼロ）で動く 1 枚 HTML にまとめ、研究室サイトへ公開した。
+
+```bash
+node scripts/build_standalone.mjs   # → standalone.html (834KB) を生成
+node test/standalone.mjs            # file:// で実走行検証（外部リクエスト0・エラー0）
+open standalone.html
+```
+
+- **公開先**: <https://kodama-lab.com/genai/dofbot/> 。ポインタは
+  <https://kodama-lab.com/genai/> の「作品一覧」**先頭カード**（サムネ `genai/img/dofbot.png`）。
+  サイトの編集元は `~/kodama-lab_mirror/`、デプロイは
+  `lftp ... mirror -R --only-newer genai/ public_html/kodama-lab.com/genai/`（手順の詳細は
+  ~/.claude の kodama-lab デプロイ・メモ）。
+- **仕組み**: `file://` では相対パスの ES モジュール import が CORS で禁止されるため、
+  ビルド時に全モジュールを文字列として埋め込み、実行時に **Blob URL 化して依存順に import** する
+  ミニバンドラを噛ませている。three.js/OrbitControls は CDN をやめて `vendor/` に同梱、
+  `fetch` していた `aipl/dofbot_xinu.abcl` と `aipl/tinyml_model.json` は fetch シムが返す。
+- ⚠ **`standalone.html` はビルド生成物**。`src/` `aipl/` `styles.css` `index.html` を編集したら
+  **必ず再生成してサイトにも上げ直す**（自動追従しない）。公開版だけ古くなるのが一番の事故。
+- 落とし穴: `String.replace` の置換文字列に three.min/CSS 由来の `$&` が混ざるので**関数リプレーサ**必須。
+  埋め込みソース中の `</script>` は `<\/script>` へ退避。
+- 落とし穴（検証）: XREA は **HeadlessChrome の UA に 403** を返す（curl は 200 で食い違う）。
+  puppeteer で本番を確認するときは `page.setUserAgent(通常の Chrome UA)` を必ず設定する。
+  これを忘れると「本番でだけ動かない」と誤診する。実ブラウザには影響しない。
+
+**未コミット**（このセッションの成果物、`~/aipl_line_simulator`）:
+`scripts/build_standalone.mjs` / `test/standalone.mjs` / `vendor/`(three 674KB + OrbitControls) /
+`standalone.html`(生成物) / `README.md` 修正。
+→ 次回の判断事項: `vendor/` と `standalone.html` を git に含めるか（含めれば「clone してすぐ開ける」、
+`vendor/` は 700KB、`standalone.html` は生成物なので `.gitignore` する手もある）。
+
+---
+
+（以下は 2026-07-15 時点のメモ）
 
 ## いまの状態
 
